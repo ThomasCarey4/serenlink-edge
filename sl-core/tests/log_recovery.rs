@@ -23,6 +23,12 @@ fn reopen(log: DurableLog<MemStorage>) -> (DurableLog<MemStorage>, sl_core::log:
     DurableLog::open(storage).unwrap()
 }
 
+/// Remove the oldest frame of a class, as the recorder's eviction does once it has declared it.
+fn evict_oldest(log: &mut DurableLog<MemStorage>, class: Class) -> Option<LostRange> {
+    let oldest = *log.front_frames(class, 1).unwrap().first()?;
+    Some(log.evict_through(class, oldest.next_offset).unwrap())
+}
+
 fn first_seqs(log: &DurableLog<MemStorage>, class: Class) -> Vec<u64> {
     log.read_all(class)
         .unwrap()
@@ -228,13 +234,13 @@ fn the_metadata_is_not_rewritten_for_every_trim() {
     // Emptying the class is different: now only the metadata knows where to continue.
     log.ack(Class::P0, 10, 10).unwrap();
     assert_eq!(generation(&log), 1);
-    log.evict_oldest(Class::P0).unwrap();
+    evict_oldest(&mut log, Class::P0);
     assert_eq!(generation(&log), 1);
 
     fill(&mut log, Class::P1, 2);
-    log.evict_oldest(Class::P1).unwrap();
+    evict_oldest(&mut log, Class::P1);
     assert_eq!(generation(&log), 1);
-    log.evict_oldest(Class::P1).unwrap();
+    evict_oldest(&mut log, Class::P1);
     assert_eq!(generation(&log), 2);
 }
 
@@ -293,7 +299,7 @@ fn evicting_removes_the_oldest_frame_and_says_what_was_lost() {
     log.append(Class::P2, 0, [1; 16], 2, b"new").unwrap();
 
     assert_eq!(
-        log.evict_oldest(Class::P2).unwrap(),
+        evict_oldest(&mut log, Class::P2),
         Some(LostRange {
             class: Class::P2,
             first_seq: 0,
@@ -302,8 +308,8 @@ fn evicting_removes_the_oldest_frame_and_says_what_was_lost() {
     );
     assert_eq!(first_seqs(&log, Class::P2), [4]);
     assert_eq!(log.peek_unsent(Class::P2).unwrap().unwrap().header.first_seq, 4);
-    log.evict_oldest(Class::P2).unwrap();
-    assert_eq!(log.evict_oldest(Class::P2).unwrap(), None);
+    evict_oldest(&mut log, Class::P2);
+    assert_eq!(evict_oldest(&mut log, Class::P2), None);
     assert_eq!(log.next_seq(Class::P2), 6);
 }
 
@@ -391,10 +397,19 @@ fn losing_the_newest_frame_does_not_break_the_chain() {
     log.set_epoch([4; 16]).unwrap(); // writes the metadata: next sequence 3, chain `tail`
     log.storage_mut().corrupt(Class::P0, frames[2].next_offset - 1);
 
-    // The frame is gone but it was written, and perhaps uploaded. Its sequence number is not
-    // handed out again, and the next frame continues from it, not from the one before.
+    // The frame rotted but it was written, and perhaps uploaded. It is kept and declared lost,
+    // not taken for a torn write. Its sequence number is not handed out again, and the next
+    // frame continues from it, not from the one before.
     let (mut log, recovery) = reopen(log);
-    assert_eq!(recovery.truncated_bytes[0], frames[2].next_offset - frames[2].offset);
+    assert_eq!(recovery.truncated_bytes, [0; 3]);
+    assert_eq!(
+        recovery.corrupt,
+        [LostRange {
+            class: Class::P0,
+            first_seq: 2,
+            count: 1
+        }]
+    );
     assert_eq!(log.lineage(Class::P0, 3, &tail).unwrap(), Lineage::Matches);
     assert_eq!(log.append(Class::P0, 0, [7; 16], 1, b"next").unwrap(), 3);
     assert_eq!(
@@ -424,14 +439,13 @@ fn corruption_of_the_oldest_frame_is_reported_too() {
     log.storage_mut().corrupt(Class::P1, oldest_payload);
 
     let (log, recovery) = reopen(log);
-    // The report starts at the last backup mark that was written down, here none. It may
-    // therefore name records the server already holds, never fewer than were lost.
+    // The frame's header is sound, so the report names exactly its records.
     assert_eq!(
         recovery.corrupt,
         [LostRange {
             class: Class::P1,
-            first_seq: 0,
-            count: 2
+            first_seq: 1,
+            count: 1
         }]
     );
     assert_eq!(first_seqs(&log, Class::P1), [2]);

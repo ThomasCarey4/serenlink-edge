@@ -1,7 +1,7 @@
-use sl_core::log::{DurableLog, LostRange, Recovery};
+use sl_core::log::{DECLARATION_RESERVE, DurableLog, LostRange, Recovery};
 use sl_core::mem_storage::MemStorage;
 use sl_core::recorder::{Recorder, RecorderConfig, Sealed};
-use sl_core::storage::StorageError;
+use sl_core::storage::{Storage, StorageError};
 use sl_proto::block::{Block, block_hash};
 use sl_proto::compress::{Compression, decompress};
 use sl_proto::ids::Class;
@@ -22,6 +22,11 @@ fn def(local_id: u32, value_type: ValueType) -> Define {
 
 fn log(capacity: u64) -> DurableLog<MemStorage> {
     DurableLog::open(MemStorage::new(capacity)).unwrap().0
+}
+
+/// Room for `bytes` of ordinary frames, above the declaration reserve.
+fn log_with_room(bytes: u64) -> DurableLog<MemStorage> {
+    log(bytes + DECLARATION_RESERVE)
 }
 
 /// A recorder that seals every open block on each tick.
@@ -148,12 +153,12 @@ fn anchors_travel_in_the_first_class() {
 
 #[test]
 fn a_full_store_evicts_the_lowest_class_and_records_the_gap() {
-    let mut log = log(2_000);
+    let mut log = log_with_room(2_000);
     let mut rec = eager();
     let mut sealed = Vec::new();
     let raw = def(9, ValueType::Blob);
     let mut t = 0;
-    while log.storage().used() + 400 < 2_000 {
+    while log.used() + 400 < 2_000 {
         rec.sample(Class::P2, &raw, t, Value::Blob(vec![0; 200]));
         rec.tick(t, &mut log, &mut sealed).unwrap();
         t += 1;
@@ -163,31 +168,33 @@ fn a_full_store_evicts_the_lowest_class_and_records_the_gap() {
     let position = def(1, ValueType::Blob);
     rec.sample(Class::P0, &position, t, Value::Blob(vec![1; 600]));
     rec.tick(t, &mut log, &mut sealed).unwrap();
-    assert_eq!(blocks(&log, Class::P0).len(), 1);
     assert!(
         log.first_retained_seq(Class::P2).unwrap() > 0,
         "raw capture should have been evicted"
     );
 
-    // The loss is reported in P0, which is evicted last, not in the class that lost data.
-    rec.tick(t + 1, &mut log, &mut sealed).unwrap();
-    let last = blocks(&log, Class::P0).pop().unwrap();
-    assert!(!last.gaps.is_empty());
+    // The loss is declared in P0, which is evicted last, not in the class that lost data,
+    // and before the block that needed the room.
+    let p0 = blocks(&log, Class::P0);
+    assert_eq!(p0.len(), 2);
+    assert!(!p0[0].gaps.is_empty());
     assert!(
-        last.gaps
+        p0[0]
+            .gaps
             .iter()
             .all(|g| g.reason == GapReason::BufferEvicted && g.lost_class == 2 && g.lost_records > 0)
     );
+    assert_eq!(p0[1].columns.len(), 1, "then the block itself");
 }
 
 #[test]
 fn a_lower_class_never_evicts_a_higher_one() {
-    let mut log = log(1_000);
+    let mut log = log_with_room(1_000);
     let mut rec = eager();
     let mut sealed = Vec::new();
     let position = def(1, ValueType::F64);
     let mut t = 0;
-    while log.storage().used() + 300 < 1_000 {
+    while log.used() + 300 < 1_000 {
         rec.sample(Class::P0, &position, t, Value::F64(1.0));
         rec.tick(t, &mut log, &mut sealed).unwrap();
         t += 1;
@@ -198,21 +205,23 @@ fn a_lower_class_never_evicts_a_higher_one() {
     rec.sample(Class::P2, &def(9, ValueType::Blob), t, Value::Blob(vec![0; 600]));
     rec.tick(t, &mut log, &mut sealed).unwrap();
 
-    assert!(sealed.is_empty());
-    assert_eq!(log.read_all(Class::P0).unwrap().len(), kept);
+    // Only the declaration of the dropped block was sealed, from the reserve; nothing in
+    // P0 was evicted for it.
+    assert_eq!(sealed.iter().map(|s| s.class).collect::<Vec<_>>(), [Class::P0]);
+    assert_eq!(log.first_retained_seq(Class::P0).unwrap(), 0);
+    assert_eq!(log.read_all(Class::P0).unwrap().len(), kept + 1);
     assert!(log.read_all(Class::P2).unwrap().is_empty());
     // The dropped block's two sequence numbers (definition and sample) are used up, and
-    // the loss is reported against exactly that range.
+    // the loss is declared against exactly that range.
     assert_eq!(log.next_seq(Class::P2), 2);
-    rec.tick(t + 1, &mut log, &mut sealed).unwrap();
     let gap = blocks(&log, Class::P0).pop().unwrap().gaps[0];
     assert_eq!((gap.lost_class, gap.lost_first_seq, gap.lost_records), (2, 0, 2));
 }
 
 #[test]
 fn a_definition_lost_to_eviction_is_written_again() {
-    let mut log = log(2_000);
-    // P0 stays open, so the gap reports do not take up room in this small store.
+    let mut log = log_with_room(2_000);
+    // P0 stays open, so its only frames are declarations.
     let cfg = RecorderConfig {
         seal_ms: [u64::MAX, 0, 0],
         ..RecorderConfig::default()
@@ -239,7 +248,7 @@ fn a_definition_lost_to_eviction_is_written_again() {
 
 #[test]
 fn a_block_too_big_for_the_store_is_dropped_without_emptying_it() {
-    let mut log = log(1_000);
+    let mut log = log_with_room(1_000);
     let mut rec = eager();
     let mut sealed = Vec::new();
     let position = def(1, ValueType::F64);
@@ -254,13 +263,15 @@ fn a_block_too_big_for_the_store_is_dropped_without_emptying_it() {
     rec.sample(Class::P0, &def(8, ValueType::Blob), 4, Value::Blob(vec![0; 5_000]));
     rec.tick(4, &mut log, &mut sealed).unwrap();
 
-    assert!(sealed.is_empty());
+    assert_eq!(sealed.len(), 1, "only the declaration of the loss");
+    assert_eq!(log.first_retained_seq(Class::P0).unwrap(), 0);
     assert_eq!(
         log.read_all(Class::P0).unwrap().len(),
-        kept,
+        kept + 1,
         "nothing may be evicted for a block that cannot fit"
     );
-    assert_eq!(log.next_seq(Class::P0), next + 2);
+    // Two numbers for the dropped block, one for the gap that declares it.
+    assert_eq!(log.next_seq(Class::P0), next + 3);
 }
 
 #[test]
@@ -278,10 +289,14 @@ fn a_block_too_large_for_the_format_is_dropped_and_reported() {
     );
     rec.tick(1, &mut log, &mut sealed).unwrap();
 
-    assert!(sealed.is_empty());
+    assert_eq!(sealed.iter().map(|s| s.class).collect::<Vec<_>>(), [Class::P0]);
     assert!(log.read_all(Class::P2).unwrap().is_empty());
-    assert_eq!((log.next_seq(Class::P2), log.storage().used()), (2, 0));
-    rec.tick(2, &mut log, &mut sealed).unwrap();
+    assert_eq!(log.next_seq(Class::P2), 2);
+    assert_eq!(
+        log.used(),
+        log.storage().end(Class::P0),
+        "only the declaration is stored"
+    );
     let gap = blocks(&log, Class::P0).pop().unwrap().gaps[0];
     assert_eq!((gap.lost_class, gap.lost_first_seq, gap.lost_records), (2, 0, 2));
 }
@@ -298,8 +313,8 @@ fn a_failed_write_loses_the_block_but_not_the_record_of_it() {
     assert!(sealed.is_empty());
 
     // The storage works again, as after a failed flash write. The block is gone; its two
-    // sequence numbers are not reused, the definition goes out again, and P0 says what
-    // was lost.
+    // sequence numbers are not reused, the definition goes out again, and the declaration
+    // that could not be written then is written now, first.
     log.storage_mut().power_on();
     rec.sample(Class::P1, &depth, 2, Value::F64(4.3));
     rec.tick(2, &mut log, &mut sealed).unwrap();
@@ -354,8 +369,7 @@ fn corruption_found_at_open_is_reported_to_the_server() {
         }],
         ..Recovery::default()
     };
-    rec.report_recovery(&recovery, 50);
-    rec.tick(50, &mut log, &mut sealed).unwrap();
+    rec.report_recovery(&recovery, 50, &mut log, &mut sealed).unwrap();
     assert_eq!(
         blocks(&log, Class::P0)[0].gaps,
         [Gap {

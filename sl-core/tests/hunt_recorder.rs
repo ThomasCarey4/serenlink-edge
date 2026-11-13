@@ -1,7 +1,7 @@
 //! Tests written to kill cargo-mutants survivors in `recorder.rs`: the block size estimate
 //! that triggers an early seal, and how consecutive evictions are merged into one gap.
 
-use sl_core::log::DurableLog;
+use sl_core::log::{DECLARATION_RESERVE, DurableLog};
 use sl_core::mem_storage::MemStorage;
 use sl_core::recorder::{Recorder, RecorderConfig};
 use sl_proto::block::Block;
@@ -114,7 +114,7 @@ fn put(rec: &mut Recorder, log: &mut DurableLog<MemStorage>, class: Class, d: &D
     rec.tick(t, log, &mut Vec::new()).unwrap();
 }
 
-/// P0 stays open, so every gap collects in one block; P1 and P2 seal on every tick.
+/// P0 stays open, so the only P0 frames are declarations; P1 and P2 seal on every tick.
 fn gap_collector() -> Recorder {
     Recorder::new(
         RecorderConfig {
@@ -125,24 +125,33 @@ fn gap_collector() -> Recorder {
     )
 }
 
-fn gaps_after_flush(rec: &mut Recorder, log: &mut DurableLog<MemStorage>, t: u64) -> Vec<(u8, u64, u64)> {
-    let mut sealed = Vec::new();
-    rec.flush(t, log, &mut sealed).unwrap();
-    let frame = log.read_all(Class::P0).unwrap().remove(0);
-    Block::decode(&frame.payload)
+/// Room for `bytes` of ordinary frames, above the declaration reserve.
+fn log_with_room(bytes: u64) -> DurableLog<MemStorage> {
+    log(bytes + DECLARATION_RESERVE)
+}
+
+/// Every declaration in P0, oldest first, as `(lost_class, first, count)` per gap.
+fn declarations(log: &DurableLog<MemStorage>) -> Vec<Vec<(u8, u64, u64)>> {
+    log.read_all(Class::P0)
         .unwrap()
-        .gaps
         .iter()
-        .map(|g| {
-            assert_eq!(g.reason, GapReason::BufferEvicted);
-            (g.lost_class, g.lost_first_seq, g.lost_records)
+        .map(|frame| {
+            Block::decode(&frame.payload)
+                .unwrap()
+                .gaps
+                .iter()
+                .map(|g| {
+                    assert_eq!(g.reason, GapReason::BufferEvicted);
+                    (g.lost_class, g.lost_first_seq, g.lost_records)
+                })
+                .collect()
         })
         .collect()
 }
 
 #[test]
 fn consecutive_evictions_from_one_class_are_reported_as_one_gap() {
-    let mut log = log(1_000);
+    let mut log = log_with_room(1_000);
     let mut rec = gap_collector();
     let raw = def(9, "raw", "", ValueType::Blob);
     // Three P2 frames: sequences 0..2 (definition and sample), 2 and 3.
@@ -165,12 +174,13 @@ fn consecutive_evictions_from_one_class_are_reported_as_one_gap() {
         "the test must evict at least two frames, evicted to {evicted}"
     );
 
-    assert_eq!(gaps_after_flush(&mut rec, &mut log, 4), [(2, 0, evicted)]);
+    assert_eq!(declarations(&log), [vec![(2, 0, evicted)]]);
 }
 
 #[test]
 fn evictions_from_different_classes_are_not_merged_even_when_their_ranges_touch() {
-    let mut log = log(1_000);
+    // Frames: A 182 bytes, B 172, C 673, D 92, E 123; a declaration of one gap about 83.
+    let mut log = log_with_room(1_024);
     let mut rec = gap_collector();
     let p1 = def(1, "one", "", ValueType::Blob);
     let p2 = def(2, "two", "", ValueType::Blob);
@@ -180,16 +190,13 @@ fn evictions_from_different_classes_are_not_merged_even_when_their_ranges_touch(
     put(&mut rec, &mut log, Class::P1, &p1, 1, 100);
     put(&mut rec, &mut log, Class::P1, &p1, 2, 600);
     assert_eq!(log.first_retained_seq(Class::P1).unwrap(), 2, "A alone is evicted");
-    // P2: D = 0..2, which fits.
-    put(&mut rec, &mut log, Class::P2, &p2, 3, 30);
+    // P2: D = 0..2, which fits beside A's declaration.
+    put(&mut rec, &mut log, Class::P2, &p2, 3, 10);
     assert_eq!(log.read_all(Class::P2).unwrap().len(), 1);
     // E needs room: D goes first (0..2 of P2), then B (2 of P1), which starts where D ended.
-    put(&mut rec, &mut log, Class::P1, &p1, 4, 150);
+    put(&mut rec, &mut log, Class::P1, &p1, 4, 50);
     assert!(log.read_all(Class::P2).unwrap().is_empty());
     assert_eq!(log.first_retained_seq(Class::P1).unwrap(), 3, "B is evicted too");
 
-    assert_eq!(
-        gaps_after_flush(&mut rec, &mut log, 5),
-        [(1, 0, 2), (2, 0, 2), (1, 2, 1)]
-    );
+    assert_eq!(declarations(&log), [vec![(1, 0, 2)], vec![(1, 2, 1), (2, 0, 2)]]);
 }
