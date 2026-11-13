@@ -1,0 +1,18 @@
+[package]
+name = "sl-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "SerenLink edge engine: durable log, recorder and upload session"
+
+[features]
+default = ["std"]
+std = ["sl-proto/std"]
+zstd = ["std", "sl-proto/zstd"]
+
+[dependencies]
+sl-proto = { workspace = true }
+crc32fast = { version = "1", default-features = false }
+
+[dev-dependencies]
+proptest = "1"
