@@ -1,0 +1,11 @@
+[workspace]
+resolver = "3"
+members = ["sl-proto"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[workspace.dependencies]
+sl-proto = { path = "sl-proto", default-features = false }

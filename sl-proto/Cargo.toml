@@ -1,0 +1,17 @@
+[package]
+name = "sl-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "SerenLink wire types and codecs"
+
+[features]
+default = ["std"]
+std = ["prost/std", "sha2/std", "ed25519-dalek/std"]
+zstd = ["std", "dep:zstd"]
+
+[dependencies]
+prost = { version = "0.13", default-features = false, features = ["derive"] }
+sha2 = { version = "0.10", default-features = false }
+ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
+zstd = { version = "0.13", optional = true }
