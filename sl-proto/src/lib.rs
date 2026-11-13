@@ -2,6 +2,8 @@
 
 extern crate alloc;
 
+pub mod block;
+pub mod compress;
 pub mod error;
 pub mod ids;
 pub mod record;
