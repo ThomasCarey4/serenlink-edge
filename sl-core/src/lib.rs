@@ -7,4 +7,5 @@ pub mod log;
 pub mod mem_storage;
 pub mod meta;
 pub mod recorder;
+pub mod session;
 pub mod storage;
