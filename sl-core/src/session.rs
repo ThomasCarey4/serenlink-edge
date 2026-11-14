@@ -27,6 +27,8 @@ pub enum SessionError {
     BadWelcome,
     /// An Ack claimed more than this session has sent, or more backed up than committed.
     BadAck,
+    /// A Rewind asked for sequences above the upload cursor: it would skip frames not sent.
+    BadRewind,
     Storage(StorageError),
 }
 
@@ -59,7 +61,12 @@ pub struct Session<G: Signer> {
     credit: [u64; 3],
     /// One past the highest sequence the server can hold in this session, per class: its
     /// mark at the Welcome, then the end of each batch sent. An Ack beyond it is a lie.
+    /// Everything held between the mark and here has been sent: the cursor starts at the
+    /// mark, goes forward one frame at a time, and a Rewind can only take it back.
     sent_next: [u64; 3],
+    /// Where the upload cursor of each class stands, as a sequence number: the server's mark
+    /// at the Welcome, then the end of each batch sent, or where a Rewind put it back to.
+    cursor: [u64; 3],
 }
 
 impl<G: Signer> Session<G> {
@@ -71,6 +78,7 @@ impl<G: Signer> Session<G> {
             state: DeviceState::Unclaimed,
             credit: [0; 3],
             sent_next: [0; 3],
+            cursor: [0; 3],
         }
     }
 
@@ -175,10 +183,12 @@ impl<G: Signer> Session<G> {
                         log.ack(class, committed, backed_up)?;
                         log.rewind(class, committed)?;
                         self.sent_next[class.index()] = committed;
+                        self.cursor[class.index()] = committed;
                     }
                 } else {
                     log.set_epoch(epoch)?;
                     self.sent_next = [0; 3];
+                    self.cursor = [0; 3];
                 }
                 self.state = welcome.state();
                 self.phase = Phase::Active;
@@ -199,9 +209,18 @@ impl<G: Signer> Session<G> {
                 Ok(Vec::new())
             }
             (Phase::Active, Body::Rewind(rewind)) => {
-                if let Some(class) = Class::from_u32(rewind.class) {
-                    log.rewind(class, rewind.from_seq)?;
+                let Some(class) = Class::from_u32(rewind.class) else {
+                    return Ok(Vec::new());
+                };
+                // A Rewind only ever asks for something again. One that points above the
+                // cursor would step over frames that were never sent: the next batch would
+                // raise `sent_next` past them, and an Ack could then trim them unsent.
+                let i = class.index();
+                if rewind.from_seq > self.cursor[i] {
+                    return Err(SessionError::BadRewind);
                 }
+                log.rewind(class, rewind.from_seq)?;
+                self.cursor[i] = rewind.from_seq;
                 Ok(Vec::new())
             }
             (Phase::Active, Body::Credit(credit)) => {
@@ -233,6 +252,7 @@ impl<G: Signer> Session<G> {
                 }
                 self.credit[i] = self.credit[i].saturating_sub(frame.payload.len() as u64);
                 self.sent_next[i] = self.sent_next[i].max(frame.end_seq());
+                self.cursor[i] = frame.end_seq();
                 log.mark_sent(&frame);
                 out.push(Envelope::of(Body::Batch(Batch {
                     class: class as u32,

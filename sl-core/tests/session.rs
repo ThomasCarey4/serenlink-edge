@@ -317,6 +317,75 @@ fn a_rewind_sends_from_the_requested_sequence_again() {
     assert_eq!(sent(&mut s, &mut log), [(0, 1), (0, 2)]);
 }
 
+fn rewind(from_seq: u64) -> Envelope {
+    Envelope::of(Body::Rewind(Rewind { class: 0, from_seq }))
+}
+
+#[test]
+fn a_rewind_above_the_cursor_is_refused() {
+    // It would move the cursor past frames that were never sent. The next batch would then
+    // raise what an Ack may claim above them, and the Ack would trim them unsent.
+    let mut s = session();
+    let mut log = log_with(5, 0);
+    fresh(&mut s, &mut log);
+    for from_seq in [1, 3, 5, u64::MAX] {
+        assert_eq!(
+            s.on_message(rewind(from_seq), &mut log),
+            Err(SessionError::BadRewind),
+            "nothing sent yet, rewind to {from_seq}"
+        );
+    }
+
+    s.on_message(credit(Class::P0, 200), &mut log).unwrap();
+    assert_eq!(sent(&mut s, &mut log), [(0, 0), (0, 1)]);
+    for from_seq in [3, 5, u64::MAX] {
+        assert_eq!(s.on_message(rewind(from_seq), &mut log), Err(SessionError::BadRewind));
+    }
+    // The cursor has not moved, and nothing was lost.
+    s.on_message(credit(Class::P0, 1_000), &mut log).unwrap();
+    assert_eq!(sent(&mut s, &mut log), [(0, 2), (0, 3), (0, 4)]);
+    assert_eq!(log.read_all(Class::P0).unwrap().len(), 5);
+}
+
+#[test]
+fn a_rewind_to_the_cursor_or_below_is_honoured() {
+    let mut s = session();
+    let mut log = log_with(4, 0);
+    fresh(&mut s, &mut log);
+    s.on_message(credit(Class::P0, 200), &mut log).unwrap();
+    assert_eq!(sent(&mut s, &mut log), [(0, 0), (0, 1)]);
+
+    // To where the cursor stands: nothing changes.
+    s.on_message(rewind(2), &mut log).unwrap();
+    s.on_message(credit(Class::P0, 100), &mut log).unwrap();
+    assert_eq!(sent(&mut s, &mut log), [(0, 2)]);
+
+    // Back, and then the way forward is closed again above where it was put.
+    s.on_message(rewind(1), &mut log).unwrap();
+    assert_eq!(s.on_message(rewind(2), &mut log), Err(SessionError::BadRewind));
+    s.on_message(credit(Class::P0, 1_000), &mut log).unwrap();
+    assert_eq!(sent(&mut s, &mut log), [(0, 1), (0, 2), (0, 3)]);
+}
+
+#[test]
+fn a_rewind_after_a_reconnect_is_bounded_by_the_servers_mark() {
+    let mut s = session();
+    let mut log = log_with(4, 0);
+    fresh(&mut s, &mut log);
+    s.on_message(credit(Class::P0, 1_000), &mut log).unwrap();
+    assert_eq!(sent(&mut s, &mut log).len(), 4);
+
+    // The cursor of the new session starts at the mark, whatever an earlier one sent.
+    s.on_disconnected();
+    let again = welcome(&log, EPOCH, ACTIVE, [2, 0, 0], [0; 3]);
+    connect(&mut s, &mut log, again);
+    assert_eq!(s.on_message(rewind(3), &mut log), Err(SessionError::BadRewind));
+    s.on_message(rewind(2), &mut log).unwrap();
+    s.on_message(rewind(0), &mut log).unwrap();
+    s.on_message(credit(Class::P0, 1_000), &mut log).unwrap();
+    assert_eq!(sent(&mut s, &mut log), [(0, 0), (0, 1), (0, 2), (0, 3)]);
+}
+
 #[test]
 fn credit_decides_what_is_sent_and_the_reported_state_does_not() {
     // The server withholds credit from a device it will not take data from. A state this
