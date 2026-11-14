@@ -114,6 +114,55 @@ fn an_impossible_count_is_rejected_before_allocating() {
 }
 
 #[test]
+fn a_bounded_decode_takes_a_block_up_to_the_limit_and_no_further() {
+    let block = sample_block();
+    let bytes = encoded(&block);
+    let n = block.record_count();
+    assert_eq!(Block::decode_bounded(&bytes, n), Ok(block.clone()));
+    assert_eq!(Block::decode_bounded(&bytes, u32::MAX), Ok(block));
+    for limit in [0, 1, 2, 3, 52, n - 1] {
+        assert_eq!(
+            Block::decode_bounded(&bytes, limit),
+            Err(DecodeError::TooManyRecords),
+            "limit {limit}"
+        );
+    }
+}
+
+#[test]
+fn the_record_limit_counts_every_kind_of_record() {
+    // One of each kind, and each alone is over a limit of nothing.
+    let mut defines = Block::new(1, 1);
+    defines.defines.push(sample_block().defines.remove(0));
+    let mut anchors = Block::new(1, 1);
+    anchors.anchors.push(sample_block().anchors.remove(0));
+    let mut gaps = Block::new(1, 1);
+    gaps.gaps.push(sample_block().gaps.remove(0));
+    let mut samples = Block::new(1, 1);
+    samples.push_sample(1, 5, Value::Bool(true));
+    for block in [defines, anchors, gaps, samples] {
+        let bytes = encoded(&block);
+        assert_eq!(Block::decode_bounded(&bytes, 0), Err(DecodeError::TooManyRecords));
+        assert_eq!(Block::decode_bounded(&bytes, 1), Ok(block));
+    }
+    assert_eq!(
+        Block::decode_bounded(&encoded(&Block::new(1, 1)), 0),
+        Ok(Block::new(1, 1))
+    );
+}
+
+#[test]
+fn a_column_over_the_record_limit_is_refused_before_its_samples_are_read() {
+    // The column says it holds three samples and then stops: with room for three records
+    // the samples are looked for and found missing, without it they are never looked for.
+    let mut bytes = vec![1, 0, 0, 0, 0, 0, 1, 1, 4, 3, 0, 0, 0];
+    assert_eq!(Block::decode_bounded(&bytes, 3), Err(DecodeError::Truncated));
+    assert_eq!(Block::decode_bounded(&bytes, 2), Err(DecodeError::TooManyRecords));
+    bytes.extend([0, 1, 0]);
+    assert_eq!(Block::decode_bounded(&bytes, 3).map(|b| b.record_count()), Ok(3));
+}
+
+#[test]
 fn an_unknown_block_version_is_rejected() {
     let mut bytes = encoded(&sample_block());
     bytes[0] = 9;

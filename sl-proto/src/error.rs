@@ -14,4 +14,6 @@ pub enum DecodeError {
     Trailing,
     /// The encoding is known but not available in this build.
     Unsupported,
+    /// A block declares more records than the caller allows.
+    TooManyRecords,
 }

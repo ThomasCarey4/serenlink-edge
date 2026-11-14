@@ -1,6 +1,8 @@
 //! Protobuf messages. Field tags are the contract: never reuse or renumber one.
 use alloc::vec::Vec;
 
+use sha2::{Digest, Sha256};
+
 pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -149,6 +151,50 @@ pub struct Batch {
     /// 16-byte running hash over the class's frames up to and including this one.
     #[prost(bytes = "vec", tag = "8")]
     pub chain: Vec<u8>,
+    /// Where the device's upload cursor for this class stood just before this frame was
+    /// sent: the server's mark from the Welcome for the first batch of a session, the end of
+    /// the batch before it otherwise, or where a Rewind put the cursor back to. It equals
+    /// `first_seq` unless the device stepped over sequences it no longer holds (evicted,
+    /// dropped or rotted), and then it is lower. The server takes a batch that is not a
+    /// resend only when this equals its own mark, so a batch that overtook another on the
+    /// way is not mistaken for such a jump. A batch without it is malformed.
+    #[prost(uint64, optional, tag = "9")]
+    pub cursor_seq: Option<u64>,
+    /// `header_check` of this batch, taken by the device when it sends. The block has its
+    /// hash; this covers every other field, so that a field damaged on the way is seen as
+    /// damage and not believed: a changed `first_seq` would otherwise read as a jump the
+    /// device made, and a changed `format_version` as a format the server cannot read. A
+    /// batch without it is malformed.
+    #[prost(bytes = "vec", tag = "10")]
+    pub check: Vec<u8>,
+}
+
+impl Batch {
+    /// First 8 bytes of SHA-256 over every field except `block` and `check`. It guards
+    /// against damage, not against the device, which can state whatever it likes.
+    pub fn header_check(&self) -> [u8; 8] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"serenlink-batch-v1");
+        hasher.update(self.class.to_le_bytes());
+        hasher.update(self.first_seq.to_le_bytes());
+        hasher.update(self.count.to_le_bytes());
+        hasher.update(self.format_version.to_le_bytes());
+        hasher.update(self.compression.to_le_bytes());
+        for field in [&self.hash, &self.chain] {
+            hasher.update((field.len() as u32).to_le_bytes());
+            hasher.update(field);
+        }
+        match self.cursor_seq {
+            Some(cursor_seq) => {
+                hasher.update([1]);
+                hasher.update(cursor_seq.to_le_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        let mut check = [0u8; 8];
+        check.copy_from_slice(&hasher.finalize()[..8]);
+        check
+    }
 }
 
 /// Sequences below `committed_next` are in the database; below `backed_up_next` they are
