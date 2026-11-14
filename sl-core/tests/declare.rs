@@ -1,6 +1,6 @@
 //! Declare before destroy: the log never removes a record that no durable gap declares.
 
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 
 use sl_core::frame::{FORMAT_V1, HEADER_LEN, build_frame};
 use sl_core::log::{DECLARATION_RESERVE, DurableLog, LostRange};
@@ -344,4 +344,239 @@ fn a_header_that_rots_at_run_time_is_found_by_the_upload_scan() {
             count: 3
         }]
     );
+}
+
+/// `MemStorage` whose metadata writes, or P0 appends, can be made to fail.
+struct Faulty<'a> {
+    inner: MemStorage,
+    fail_meta: &'a Cell<bool>,
+    fail_p0: &'a Cell<bool>,
+}
+
+impl Storage for Faulty<'_> {
+    fn capacity(&self) -> u64 {
+        self.inner.capacity()
+    }
+    fn start(&self, class: Class) -> u64 {
+        self.inner.start(class)
+    }
+    fn end(&self, class: Class) -> u64 {
+        self.inner.end(class)
+    }
+    fn append(&mut self, class: Class, data: &[u8]) -> Result<(), StorageError> {
+        if class == Class::P0 && self.fail_p0.get() {
+            return Err(StorageError::Io);
+        }
+        self.inner.append(class, data)
+    }
+    fn read(&self, class: Class, offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+        self.inner.read(class, offset, buf)
+    }
+    fn trim_front(&mut self, class: Class, new_start: u64) -> Result<(), StorageError> {
+        self.inner.trim_front(class, new_start)
+    }
+    fn truncate(&mut self, class: Class, new_end: u64) -> Result<(), StorageError> {
+        self.inner.truncate(class, new_end)
+    }
+    fn read_meta(&self, slot: usize) -> Result<Option<Vec<u8>>, StorageError> {
+        self.inner.read_meta(slot)
+    }
+    fn write_meta(&mut self, slot: usize, data: &[u8]) -> Result<(), StorageError> {
+        if self.fail_meta.get() {
+            return Err(StorageError::Io);
+        }
+        self.inner.write_meta(slot, data)
+    }
+}
+
+#[test]
+fn rot_that_grows_past_a_declared_range_is_declared_before_it_is_trimmed() {
+    // P1 holds A(0), B(1), C(2), D(3).
+    let mut log = open(100_000);
+    let frame = (HEADER_LEN + 100) as u64;
+    for k in 0..4u8 {
+        log.append(Class::P1, 0, [k; 16], 1, &[k; 100]).unwrap();
+    }
+    // B's header rots. The scan steps past it to C, which waits for credit.
+    log.storage_mut().corrupt(Class::P1, frame + 20);
+    let a = log.peek_unsent(Class::P1).unwrap().unwrap();
+    log.mark_sent(&a);
+    let c = log.peek_unsent(Class::P1).unwrap().unwrap();
+    assert_eq!(c.header.first_seq, 2);
+    let mut rec = eager();
+    let mut sealed = Vec::new();
+    rec.tick(1, &mut log, &mut sealed).unwrap();
+    assert!(is_declared(&log, Class::P1, 1));
+
+    // C's header rots too. The scan now steps past B and C as one stretch, [1, 3).
+    log.storage_mut().corrupt(Class::P1, 2 * frame + 20);
+    let d = log.peek_unsent(Class::P1).unwrap().unwrap();
+    assert_eq!(d.header.first_seq, 3);
+    assert!(!log.undeclared().is_empty(), "C's loss is noted");
+    log.mark_sent(&d);
+    rec.tick(2, &mut log, &mut sealed).unwrap();
+    log.ack(Class::P1, 4, 4).unwrap();
+    assert!(is_declared(&log, Class::P1, 2), "seq 2 trimmed without a durable gap");
+}
+
+#[test]
+fn declarations_that_free_nothing_leave_room_to_declare_an_eviction() {
+    let mut log = open(2_000 + DECLARATION_RESERVE);
+    let mut rec = eager();
+    let mut t = 0;
+    while log.used() + 300 < 2_000 {
+        t += 1;
+        put(&mut rec, &mut log, Class::P2, t, 200);
+    }
+    // Eight P2 blocks too large ever to fit: each is dropped, and its loss declared or owed.
+    let dropped_from = log.next_seq(Class::P2);
+    for _ in 0..8 {
+        t += 1;
+        put(&mut rec, &mut log, Class::P2, t, 3_000);
+    }
+    let dropped_to = log.next_seq(Class::P2);
+    assert!(dropped_to > dropped_from);
+
+    // A P0 block evicts old P2 to make room; it is not dropped.
+    let p0_next = log.next_seq(Class::P0);
+    t += 1;
+    put(&mut rec, &mut log, Class::P0, t, 200);
+    let stored = log.read_all(Class::P0).unwrap().iter().any(|frame| {
+        frame.header.first_seq >= p0_next && Block::decode(&frame.payload).is_ok_and(|block| !block.columns.is_empty())
+    });
+    assert!(stored, "P0 data dropped while old P2 data stayed");
+    // What was owed went out with the eviction's declaration, not a later one.
+    for seq in dropped_from..dropped_to {
+        assert!(is_declared(&log, Class::P2, seq), "dropped P2 {seq} not declared");
+    }
+}
+
+#[test]
+fn evicting_a_rotted_p0_declaration_declares_this_boots_losses_again() {
+    let mut log = open(3_000 + DECLARATION_RESERVE);
+    let mut rec = eager();
+    // A P2 block too large ever to fit: dropped, and declared in P0 frame 0.
+    put(&mut rec, &mut log, Class::P2, 1, 4_000);
+    assert!(is_declared(&log, Class::P2, 0));
+    // That declaration's payload rots, and P0 fills up offline until it is evicted.
+    log.storage_mut().corrupt(Class::P0, HEADER_LEN as u64 + 5);
+    for t in 2..42 {
+        put(&mut rec, &mut log, Class::P0, t, 200);
+    }
+    assert!(log.first_retained_seq(Class::P0).unwrap() > 0, "frame 0 was evicted");
+    assert!(is_declared(&log, Class::P2, 0), "its only declaration was evicted");
+}
+
+#[test]
+fn a_dropped_block_is_reported_declared_even_when_its_skip_fails() {
+    let fail_meta = Cell::new(false);
+    let fail_p0 = Cell::new(false);
+    let storage = Faulty {
+        inner: MemStorage::new(3_000 + DECLARATION_RESERVE),
+        fail_meta: &fail_meta,
+        fail_p0: &fail_p0,
+    };
+    let (mut log, _) = DurableLog::open(storage).unwrap();
+    let mut rec = eager();
+    rec.sample(Class::P2, &def(3), 1, Value::Blob(vec![1; 4_000]));
+    fail_meta.set(true);
+    let mut sealed = Vec::new();
+    assert_eq!(rec.tick(1, &mut log, &mut sealed), Err(StorageError::Io));
+    assert!(is_declared(&log, Class::P2, 0));
+    assert_eq!(sealed.len(), 1, "the durable declaration is reported");
+    assert_eq!(sealed[0].class, Class::P0);
+}
+
+#[test]
+fn a_block_lost_while_making_room_is_accounted_for_like_any_dropped_block() {
+    let fail_meta = Cell::new(false);
+    let fail_p0 = Cell::new(false);
+    let storage = Faulty {
+        inner: MemStorage::new(1_000 + DECLARATION_RESERVE),
+        fail_meta: &fail_meta,
+        fail_p0: &fail_p0,
+    };
+    let (mut log, _) = DurableLog::open(storage).unwrap();
+    let mut rec = eager();
+    for t in 0..3 {
+        put(&mut rec, &mut log, Class::P2, t, 200);
+    }
+    // The eviction's declaration fails to write, so the P1 block is lost.
+    rec.sample(Class::P1, &def(2), 3, Value::Blob(vec![3; 400]));
+    fail_p0.set(true);
+    let mut sealed = Vec::new();
+    assert_eq!(rec.tick(3, &mut log, &mut sealed), Err(StorageError::Io));
+    fail_p0.set(false);
+    assert!(log.next_seq(Class::P1) > 0, "its numbers are used up");
+
+    // The next block of that signal carries its definition again, and the loss is declared.
+    let sealed = put(&mut rec, &mut log, Class::P1, 4, 10);
+    let block = sealed.iter().find(|s| s.class == Class::P1).unwrap();
+    let frame = log
+        .read_all(Class::P1)
+        .unwrap()
+        .into_iter()
+        .find(|f| f.header.first_seq == block.first_seq)
+        .unwrap();
+    assert_eq!(Block::decode(&frame.payload).unwrap().defines.len(), 1);
+    assert!(is_declared(&log, Class::P1, 0));
+}
+
+#[test]
+fn open_repairs_a_flipped_bit_in_each_of_the_two_newest_headers() {
+    let mut log = open(100_000);
+    log.append(Class::P1, 0, [1; 16], 3, &[1; 100]).unwrap();
+    let second = log.storage().end(Class::P1);
+    log.append(Class::P1, 0, [2; 16], 5, &[2; 100]).unwrap();
+    let third = log.storage().end(Class::P1);
+    log.append(Class::P1, 0, [3; 16], 2, &[3; 100]).unwrap();
+    // The metadata was never written, so only the frames say where the sequence stands.
+    log.storage_mut().corrupt(Class::P1, second + 20);
+    log.storage_mut().corrupt(Class::P1, third + 20);
+
+    let (mut log, recovery) = reopen(log);
+    assert_eq!(recovery.truncated_bytes, [0; 3]);
+    assert_eq!(
+        recovery.corrupt,
+        [
+            LostRange {
+                class: Class::P1,
+                first_seq: 3,
+                count: 5
+            },
+            LostRange {
+                class: Class::P1,
+                first_seq: 8,
+                count: 2
+            }
+        ]
+    );
+    assert_eq!(log.append(Class::P1, 0, [9; 16], 1, b"x").unwrap(), 10);
+}
+
+#[test]
+fn rot_found_in_a_full_store_is_declared_by_evicting_rather_than_left_blocking_the_trim() {
+    // Ordinary frames fill their room; the oldest one rots.
+    let mut log = open(1_000 + DECLARATION_RESERVE);
+    for k in 0..5u8 {
+        log.append(Class::P0, 0, [k; 16], 1, &[k; 200 - HEADER_LEN]).unwrap();
+    }
+    assert_eq!(log.used(), 1_000);
+    log.storage_mut().corrupt(Class::P0, (HEADER_LEN + 10) as u64);
+    let frame = log.peek_unsent(Class::P0).unwrap().unwrap();
+    assert_eq!(frame.header.first_seq, 1);
+    assert_eq!(log.undeclared().len(), 1);
+
+    // There is no room for the declaration above the part of the reserve kept for evictions,
+    // so it goes out with one, and the trim is no longer held at the rot.
+    let mut rec = eager();
+    let mut sealed = Vec::new();
+    rec.tick(1, &mut log, &mut sealed).unwrap();
+    assert_eq!(sealed.len(), 1);
+    assert!(log.undeclared().is_empty());
+    assert!(is_declared(&log, Class::P0, 0));
+    let first = log.first_retained_seq(Class::P0).unwrap();
+    for seq in 0..first {
+        assert!(is_declared(&log, Class::P0, seq), "P0 {seq} lost without a gap");
+    }
 }

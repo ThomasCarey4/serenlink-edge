@@ -29,8 +29,9 @@ impl LostRange {
         self.first_seq.saturating_add(self.count)
     }
 
-    fn overlaps(&self, other: &LostRange) -> bool {
-        self.class == other.class && self.first_seq < other.end_seq() && other.first_seq < self.end_seq()
+    /// Whether every sequence number of `other` lies in this range.
+    fn contains(&self, other: &LostRange) -> bool {
+        self.class == other.class && self.first_seq <= other.first_seq && other.end_seq() <= self.end_seq()
     }
 }
 
@@ -342,9 +343,10 @@ impl<S: Storage> DurableLog<S> {
                 valid_end = found.next_offset;
             }
             recovery.corrupt.append(&mut scan.lost);
-            // After the last sound frame: a frame whose header rotted, or a torn write.
-            let floor = newest.map_or(meta.backed_up_next[i], |(seq, _)| seq);
-            if let Some(found) = repaired_header_at(&storage, class, valid_end, floor)? {
+            // After the last sound frame: frames whose headers rotted, or a torn write.
+            let mut floor = newest.map_or(meta.backed_up_next[i], |(seq, _)| seq);
+            while let Some(found) = repaired_header_at(&storage, class, valid_end, floor)? {
+                floor = found.header.end_seq();
                 recovery.corrupt.push(found.lost(class));
                 newest = Some((found.header.end_seq(), found.header.chain));
                 valid_end = found.next_offset;
@@ -506,14 +508,17 @@ impl<S: Storage> DurableLog<S> {
         let frame = scan.next_frame()?;
         // Bytes after the last frame are, at run time, a frame whose header rotted: a torn
         // write leaves the storage dead, and `open` removes it.
-        if frame.is_none()
-            && scan.skipped
-            && let Some(found) = repaired_header_at(&self.storage, class, scan.skipped_from, scan.floor)?
-        {
-            scan.lost.push(found.lost(class));
+        if frame.is_none() && scan.skipped {
+            let (mut offset, mut floor) = (scan.skipped_from, scan.floor);
+            while let Some(found) = repaired_header_at(&self.storage, class, offset, floor)? {
+                scan.lost.push(found.lost(class));
+                (offset, floor) = (found.next_offset, found.header.end_seq());
+            }
         }
+        // A range is new unless one already noted holds all of it. One scan can report rot
+        // that is already declared together with rot next to it that is not, as one range.
         for lost in scan.lost {
-            if !self.rot.iter().any(|(known, _)| known.overlaps(&lost)) {
+            if !self.rot.iter().any(|(known, _)| known.contains(&lost)) {
                 self.rot.push((lost, false));
             }
         }

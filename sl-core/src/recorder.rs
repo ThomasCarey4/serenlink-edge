@@ -189,22 +189,28 @@ impl Recorder {
         log: &mut DurableLog<S>,
         sealed: &mut Vec<Sealed>,
     ) -> Result<(), StorageError> {
-        let mut gaps: Vec<Gap> = lost
-            .iter()
-            .map(|lost| self.loss(GapReason::Corrupt, lost.class, now_ms, lost.first_seq, lost.count))
-            .collect();
-        // A rotted P0 frame may have been a declaration: declare again what this boot has.
-        if lost.iter().any(|lost| lost.class == Class::P0) {
-            gaps.extend(self.declared.iter().copied());
-        }
+        let gaps = self.corrupt_gaps(lost, now_ms);
         // Until a declaration is durable, the log keeps what it names.
-        if let Some(declaration) = self.declare(gaps, log)? {
+        if let Some(declaration) = self.declare(gaps, now_ms, log)? {
             sealed.push(declaration);
             for lost in lost {
                 log.release(*lost);
             }
         }
         Ok(())
+    }
+
+    /// The gaps that declare `lost` as corrupt. A rotted P0 frame may have been a declaration,
+    /// so with one among them, what this boot has declared is declared again.
+    fn corrupt_gaps(&self, lost: &[LostRange], now_ms: u64) -> Vec<Gap> {
+        let mut gaps: Vec<Gap> = lost
+            .iter()
+            .map(|lost| self.loss(GapReason::Corrupt, lost.class, now_ms, lost.first_seq, lost.count))
+            .collect();
+        if lost.iter().any(|lost| lost.class == Class::P0) {
+            gaps.extend(self.declared.iter().copied());
+        }
+        gaps
     }
 
     fn seal<S: Storage>(
@@ -253,11 +259,14 @@ impl Recorder {
                         });
                         return Ok(());
                     }
-                    Err(StorageError::Full) => {
-                        if !self.make_room(class, frame_len, now_ms, log, sealed)? {
-                            break;
+                    Err(StorageError::Full) => match self.make_room(class, frame_len, now_ms, log, sealed) {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(e) => {
+                            let _ = self.drop_block(class, now_ms, &block, count, log, sealed);
+                            return Err(e);
                         }
-                    }
+                    },
                     Err(StorageError::TooLarge) => break,
                     Err(e) => {
                         // The write failed part-way. The block is lost all the same, and
@@ -292,16 +301,20 @@ impl Recorder {
         let first_seq = log.next_seq(class);
         let skipped = log.skip(class, count);
         let gap = self.loss(GapReason::BufferEvicted, class, now_ms, first_seq, u64::from(count));
-        let declared = self.declare(vec![gap], log);
+        let declared = self.declare(vec![gap], now_ms, log);
+        // A declaration that is durable is reported even when the metadata write failed.
+        if let Ok(Some(declaration)) = declared {
+            sealed.push(declaration);
+        }
         skipped?;
-        sealed.extend(declared?);
-        Ok(())
+        declared.map(|_| ())
     }
 
     /// Make room for a frame of `frame_len` bytes in `class` by evicting whole frames, lowest
     /// priority first, never from a class above `class`. The loss is declared in a durable
-    /// block before anything is removed. Returns `false`, having removed nothing, when
-    /// evicting everything eligible would still not be enough.
+    /// block before anything is removed, and so is everything owed. Returns `false`, having
+    /// removed nothing, when evicting everything eligible would still not be enough. With a
+    /// `frame_len` of 0 it only makes the reserve whole again, for the owed declaration.
     fn make_room<S: Storage>(
         &mut self,
         class: Class,
@@ -313,13 +326,18 @@ impl Recorder {
         // Room for the frame once the declaration, too, is written.
         let capacity = log.storage().capacity();
         let shortfall = (log.used() + frame_len + DECLARATION_RESERVE).saturating_sub(capacity);
+        // Declarations still owed, and rot not yet declared, go out with this one.
+        let pending = log.undeclared();
+        let mut carried = self.corrupt_gaps(&pending, now_ms);
+        carried.extend(self.owed.iter().copied());
         let mut target = shortfall.max(1);
         let (plan, declaration) = loop {
             let (plan, freed) = self.plan_eviction(class, target, log)?;
             if freed < target {
                 return Ok(false);
             }
-            let gaps = self.eviction_gaps(&plan, now_ms, log)?;
+            let mut gaps = self.eviction_gaps(&plan, now_ms, log)?;
+            gaps.extend(carried.iter().copied());
             let declaration = self.declaration(gaps);
             let need = shortfall
                 + declaration
@@ -337,6 +355,10 @@ impl Recorder {
                 // No room even for the declaration: nothing may be evicted undeclared.
                 Err(StorageError::Full) => return Ok(false),
                 Err(e) => return Err(e),
+            }
+            self.owed.clear();
+            for lost in pending {
+                log.release(lost);
             }
         }
         for (victim, frames) in &plan {
@@ -388,34 +410,64 @@ impl Recorder {
             if *victim != Class::P0 {
                 continue;
             }
+            // Bytes before or between the frames found are a frame whose header rotted.
+            let mut unreadable = frames[0].offset != log.storage().start(Class::P0)
+                || frames.windows(2).any(|pair| pair[0].next_offset != pair[1].offset);
             for frame in frames {
                 match carried_gaps(log, frame)? {
                     Some(carried) => gaps.extend(carried),
-                    // Unreadable: whatever it declared is lost with it.
-                    None => gaps.push(self.loss(
-                        GapReason::Corrupt,
-                        Class::P0,
-                        now_ms,
-                        frame.first_seq,
-                        u64::from(frame.count),
-                    )),
+                    None => {
+                        unreadable = true;
+                        gaps.push(self.loss(
+                            GapReason::Corrupt,
+                            Class::P0,
+                            now_ms,
+                            frame.first_seq,
+                            u64::from(frame.count),
+                        ));
+                    }
                 }
+            }
+            // An unreadable P0 frame may have been a declaration: what it carried is lost with
+            // it, so declare again what this boot has.
+            if unreadable {
+                gaps.extend(self.declared.iter().copied());
             }
         }
         Ok(gaps)
     }
 
-    /// Seal `gaps` into P0 as a block of their own, using the declaration reserve if it must,
-    /// so that they are durable before the records they name are removed.
-    /// Gaps still owed from an earlier failure go out with these. If the write fails, they
-    /// are all owed; when it fails only for want of room, that is not an error, and `None`
-    /// says nothing was declared.
-    fn declare<S: Storage>(&mut self, gaps: Vec<Gap>, log: &mut DurableLog<S>) -> Result<Option<Sealed>, StorageError> {
+    /// Seal `gaps` into P0 as a block of their own, so that they are durable before the
+    /// records they name are removed. Gaps still owed from an earlier failure go out with
+    /// these. If the write fails, they are all owed; when it fails only for want of room, that
+    /// is not an error, and `None` says nothing was declared.
+    ///
+    /// Such a declaration frees nothing, so it may use the reserve only down to its last
+    /// `DECLARATION_MAX` bytes, which an eviction's declaration can then always use. Past
+    /// that, it goes out with an eviction, of the classes it names and those below them.
+    fn declare<S: Storage>(
+        &mut self,
+        gaps: Vec<Gap>,
+        now_ms: u64,
+        log: &mut DurableLog<S>,
+    ) -> Result<Option<Sealed>, StorageError> {
         let mut gaps = merge_gaps(gaps);
         gaps.append(&mut self.owed);
         let Some((encoded, count)) = self.declaration(gaps.clone()) else {
             return Ok(None);
         };
+        let room = log.storage().capacity().saturating_sub(DECLARATION_MAX);
+        if log.used() + (HEADER_LEN + encoded.len()) as u64 > room {
+            // `make_room` declares what is owed with its eviction, and clears it once durable.
+            self.owed = merge_gaps(gaps);
+            let class = Class::ALL
+                .into_iter()
+                .find(|class| self.owed.iter().any(|gap| gap.lost_class == *class as u8))
+                .unwrap_or(Class::P2);
+            let mut sealed = Vec::new();
+            self.make_room(class, 0, now_ms, log, &mut sealed)?;
+            return Ok(sealed.pop());
+        }
         match self.write_declaration(&encoded, count, log) {
             Ok(sealed) => Ok(Some(sealed)),
             Err(e) => {
