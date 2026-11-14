@@ -133,14 +133,26 @@ impl Block {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Block, DecodeError> {
-        let mut r = Reader { buf, pos: 0 };
+        Self::decode_bounded(buf, u32::MAX)
+    }
+
+    /// Decode a block that may hold at most `max_records` records. Each count in the block is
+    /// held against what is left of that allowance as it is read, before anything is
+    /// allocated for it, so the work done for bytes from a stranger is bounded by the limit
+    /// and not by what the bytes claim. A block over the limit is `TooManyRecords`.
+    pub fn decode_bounded(buf: &[u8], max_records: u32) -> Result<Block, DecodeError> {
+        let mut r = Reader {
+            buf,
+            pos: 0,
+            records_left: u64::from(max_records),
+        };
         let version = r.u8()?;
         if version != BLOCK_VERSION {
             return Err(DecodeError::BadTag(version));
         }
         let mut block = Block::new(r.u32()?, r.u32()?);
 
-        for _ in 0..r.count()? {
+        for _ in 0..r.records()? {
             let local_id = r.u32()?;
             let stable_key = r.u64()?;
             let path = r.string()?;
@@ -160,7 +172,7 @@ impl Block {
             });
         }
 
-        for _ in 0..r.count()? {
+        for _ in 0..r.records()? {
             let mono_ms = r.u64()?;
             let utc_ms = r.u64()?;
             let source = r.u8()?;
@@ -174,7 +186,7 @@ impl Block {
             });
         }
 
-        for _ in 0..r.count()? {
+        for _ in 0..r.records()? {
             let reason = r.u8()?;
             let reason = GapReason::from_u8(reason).ok_or(DecodeError::BadTag(reason))?;
             block.gaps.push(Gap {
@@ -191,15 +203,14 @@ impl Block {
         for _ in 0..r.count()? {
             let local_id = r.u32()?;
             let value_type = r.value_type()?;
-            let n = r.count()?;
+            let n = r.records()?;
             let mut times = Vec::with_capacity(n);
             let mut prev = 0u64;
             for _ in 0..n {
                 prev = prev.wrapping_add(r.i64()? as u64);
                 times.push(prev);
             }
-            let values = decode_values(&mut r, value_type, n)?;
-            let samples = times.into_iter().zip(values).collect();
+            let samples = decode_samples(&mut r, value_type, &times)?;
             block.columns.push(Column {
                 local_id,
                 value_type,
@@ -315,72 +326,79 @@ fn encode_values(out: &mut Vec<u8>, c: &Column) {
     }
 }
 
-fn decode_values(r: &mut Reader<'_>, value_type: ValueType, n: usize) -> Result<Vec<Value>, DecodeError> {
-    let mut values = Vec::with_capacity(n);
+/// The values of one column, each paired with its time.
+fn decode_samples(r: &mut Reader<'_>, value_type: ValueType, times: &[u64]) -> Result<Vec<(u64, Value)>, DecodeError> {
+    let mut samples = Vec::with_capacity(times.len());
     match value_type {
         ValueType::F32 => {
             let mut prev = 0u32;
-            for _ in 0..n {
+            for &t in times {
                 let mut raw = [0u8; 4];
                 raw.copy_from_slice(r.bytes(4)?);
                 prev ^= u32::from_le_bytes(raw);
-                values.push(Value::F32(f32::from_bits(prev)));
+                samples.push((t, Value::F32(f32::from_bits(prev))));
             }
         }
         ValueType::F64 => {
             let mut prev = 0u64;
-            for _ in 0..n {
+            for &t in times {
                 let mut raw = [0u8; 8];
                 raw.copy_from_slice(r.bytes(8)?);
                 prev ^= u64::from_le_bytes(raw);
-                values.push(Value::F64(f64::from_bits(prev)));
+                samples.push((t, Value::F64(f64::from_bits(prev))));
             }
         }
         ValueType::I64 => {
             let mut prev = 0i64;
-            for _ in 0..n {
+            for &t in times {
                 prev = prev.wrapping_add(r.i64()?);
-                values.push(Value::I64(prev));
+                samples.push((t, Value::I64(prev)));
             }
         }
         ValueType::Bool => {
-            for _ in 0..n {
-                values.push(Value::Bool(match r.u8()? {
+            for &t in times {
+                let value = match r.u8()? {
                     0 => false,
                     1 => true,
                     other => return Err(DecodeError::BadTag(other)),
-                }));
+                };
+                samples.push((t, Value::Bool(value)));
             }
         }
         ValueType::Enum => {
-            for _ in 0..n {
-                values.push(Value::Enum(r.u32()?));
+            for &t in times {
+                samples.push((t, Value::Enum(r.u32()?)));
             }
         }
         ValueType::Position => {
             let (mut lat, mut lon) = (0i32, 0i32);
-            for _ in 0..n {
+            for &t in times {
                 lat = lat.wrapping_add(r.i32()?);
                 lon = lon.wrapping_add(r.i32()?);
-                values.push(Value::Position {
-                    lat_e7: lat,
-                    lon_e7: lon,
-                });
+                samples.push((
+                    t,
+                    Value::Position {
+                        lat_e7: lat,
+                        lon_e7: lon,
+                    },
+                ));
             }
         }
         ValueType::Blob => {
-            for _ in 0..n {
+            for &t in times {
                 let len = r.count()?;
-                values.push(Value::Blob(r.bytes(len)?.to_vec()));
+                samples.push((t, Value::Blob(r.bytes(len)?.to_vec())));
             }
         }
     }
-    Ok(values)
+    Ok(samples)
 }
 
 struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// Records the block may still declare.
+    records_left: u64,
 }
 
 impl<'a> Reader<'a> {
@@ -418,6 +436,16 @@ impl<'a> Reader<'a> {
             return Err(DecodeError::BadLength);
         }
         Ok(n as usize)
+    }
+
+    /// A count of records. As `count`, and also held against the block's record limit.
+    fn records(&mut self) -> Result<usize, DecodeError> {
+        let n = self.count()?;
+        if n as u64 > self.records_left {
+            return Err(DecodeError::TooManyRecords);
+        }
+        self.records_left -= n as u64;
+        Ok(n)
     }
 
     fn bytes(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
