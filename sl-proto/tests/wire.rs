@@ -48,6 +48,7 @@ fn every_body() -> Vec<Body> {
             block: vec![4; 300],
             chain: vec![5; 16],
             cursor_seq: Some(96),
+            check: vec![6; 8],
         }),
         Body::Ack(Ack {
             class: 0,
@@ -99,6 +100,81 @@ fn a_batch_says_whether_it_states_its_cursor() {
         };
         assert_eq!(back.cursor_seq, cursor_seq);
     }
+}
+
+fn checked_batch() -> Batch {
+    Batch {
+        class: 2,
+        first_seq: 100,
+        count: 12,
+        format_version: 1,
+        compression: 1,
+        hash: vec![3; 16],
+        block: vec![4; 300],
+        chain: vec![5; 16],
+        cursor_seq: Some(96),
+        check: Vec::new(),
+    }
+}
+
+/// What the header check is taken over, byte for byte. A server built from another copy of
+/// this code must arrive at the same bytes.
+#[test]
+fn the_batch_header_check_is_frozen() {
+    use sha2::{Digest, Sha256};
+    let expected: Vec<u8> = [
+        b"serenlink-batch-v1".as_slice(),
+        &[2, 0, 0, 0],
+        &[100, 0, 0, 0, 0, 0, 0, 0],
+        &[12, 0, 0, 0],
+        &[1, 0, 0, 0],
+        &[1, 0, 0, 0],
+        &[16, 0, 0, 0],
+        &[3; 16],
+        &[16, 0, 0, 0],
+        &[5; 16],
+        &[1],
+        &[96, 0, 0, 0, 0, 0, 0, 0],
+    ]
+    .concat();
+    assert_eq!(checked_batch().header_check()[..], Sha256::digest(&expected)[..8]);
+
+    let mut silent = checked_batch();
+    silent.cursor_seq = None;
+    let n = expected.len() - 9;
+    let expected = [&expected[..n], &[0]].concat();
+    assert_eq!(silent.header_check()[..], Sha256::digest(&expected)[..8]);
+}
+
+#[test]
+fn the_header_check_covers_every_field_but_the_block() {
+    let base = checked_batch().header_check();
+    let changes: [fn(&mut Batch); 10] = [
+        |b| b.class = 0,
+        |b| b.first_seq = 108,
+        |b| b.count = 13,
+        |b| b.format_version = 5,
+        |b| b.compression = 0,
+        |b| b.hash[15] ^= 1,
+        |b| b.chain[0] ^= 0x80,
+        |b| b.cursor_seq = Some(100),
+        |b| b.cursor_seq = None,
+        |b| b.cursor_seq = Some(0),
+    ];
+    for change in changes {
+        let mut b = checked_batch();
+        change(&mut b);
+        assert_ne!(b.header_check(), base);
+    }
+    // A byte cannot move from the hash to the chain unseen.
+    let mut b = checked_batch();
+    b.chain.insert(0, b.hash.pop().unwrap());
+    assert_ne!(b.header_check(), base);
+    // The block has its own hash, and the check does not cover itself.
+    let mut b = checked_batch();
+    b.block.clear();
+    b.check = vec![1; 8];
+    assert_eq!(b.header_check(), base);
 }
 
 #[test]

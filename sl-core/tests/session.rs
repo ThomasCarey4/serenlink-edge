@@ -424,6 +424,17 @@ fn a_batch_states_where_the_cursor_stood_before_it() {
 }
 
 #[test]
+fn a_batch_carries_a_check_over_its_header() {
+    let mut s = session();
+    let mut log = log_with(2, 0);
+    fresh(&mut s, &mut log);
+    s.on_message(credit(Class::P0, 1_000), &mut log).unwrap();
+    for batch in batches(s.poll(&mut log).unwrap()) {
+        assert_eq!(batch.check, batch.header_check());
+    }
+}
+
+#[test]
 fn a_batch_after_dropped_sequences_states_the_cursor_below_its_first_sequence() {
     // The device says it stepped over the sequences itself. The server would otherwise have
     // to guess whether they were skipped or are still on their way.

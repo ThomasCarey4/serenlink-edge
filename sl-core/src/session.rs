@@ -257,7 +257,7 @@ impl<G: Signer> Session<G> {
                 let cursor_seq = self.cursor[i];
                 self.cursor[i] = frame.end_seq();
                 log.mark_sent(&frame);
-                out.push(Envelope::of(Body::Batch(Batch {
+                let mut batch = Batch {
                     class: class as u32,
                     first_seq: frame.header.first_seq,
                     count: frame.header.count,
@@ -267,7 +267,10 @@ impl<G: Signer> Session<G> {
                     chain: frame.header.chain.to_vec(),
                     block: frame.payload,
                     cursor_seq: Some(cursor_seq),
-                })));
+                    check: Vec::new(),
+                };
+                batch.check = batch.header_check().to_vec();
+                out.push(Envelope::of(Body::Batch(batch)));
             }
         }
         Ok(out)
