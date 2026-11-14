@@ -66,6 +66,8 @@ pub struct Session<G: Signer> {
     sent_next: [u64; 3],
     /// Where the upload cursor of each class stands, as a sequence number: the server's mark
     /// at the Welcome, then the end of each batch sent, or where a Rewind put it back to.
+    /// Every batch states it, so the server can tell a sequence jump the device made from a
+    /// batch that went missing on the way.
     cursor: [u64; 3],
 }
 
@@ -252,6 +254,7 @@ impl<G: Signer> Session<G> {
                 }
                 self.credit[i] = self.credit[i].saturating_sub(frame.payload.len() as u64);
                 self.sent_next[i] = self.sent_next[i].max(frame.end_seq());
+                let cursor_seq = self.cursor[i];
                 self.cursor[i] = frame.end_seq();
                 log.mark_sent(&frame);
                 out.push(Envelope::of(Body::Batch(Batch {
@@ -263,6 +266,7 @@ impl<G: Signer> Session<G> {
                     hash: frame.header.hash.to_vec(),
                     chain: frame.header.chain.to_vec(),
                     block: frame.payload,
+                    cursor_seq: Some(cursor_seq),
                 })));
             }
         }

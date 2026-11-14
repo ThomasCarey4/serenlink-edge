@@ -149,6 +149,15 @@ pub struct Batch {
     /// 16-byte running hash over the class's frames up to and including this one.
     #[prost(bytes = "vec", tag = "8")]
     pub chain: Vec<u8>,
+    /// Where the device's upload cursor for this class stood just before this frame was
+    /// sent: the server's mark from the Welcome for the first batch of a session, the end of
+    /// the batch before it otherwise, or where a Rewind put the cursor back to. It equals
+    /// `first_seq` unless the device stepped over sequences it no longer holds (evicted,
+    /// dropped or rotted), and then it is lower. The server takes a batch that is not a
+    /// resend only when this equals its own mark, so a batch that overtook another on the
+    /// way is not mistaken for such a jump. A batch without it is malformed.
+    #[prost(uint64, optional, tag = "9")]
+    pub cursor_seq: Option<u64>,
 }
 
 /// Sequences below `committed_next` are in the database; below `backed_up_next` they are

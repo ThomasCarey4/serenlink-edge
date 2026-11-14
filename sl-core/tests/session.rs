@@ -386,6 +386,88 @@ fn a_rewind_after_a_reconnect_is_bounded_by_the_servers_mark() {
     assert_eq!(sent(&mut s, &mut log), [(0, 0), (0, 1), (0, 2), (0, 3)]);
 }
 
+/// `(first_seq, cursor_seq)` of each batch a poll sends.
+fn cursors(s: &mut Session<KeySigner>, log: &mut DurableLog<MemStorage>) -> Vec<(u64, Option<u64>)> {
+    batches(s.poll(log).unwrap())
+        .iter()
+        .map(|b| (b.first_seq, b.cursor_seq))
+        .collect()
+}
+
+#[test]
+fn a_batch_states_where_the_cursor_stood_before_it() {
+    let mut s = session();
+    let mut log = log_with(3, 0);
+    fresh(&mut s, &mut log);
+    s.on_message(credit(Class::P0, 1_000), &mut log).unwrap();
+    // Several batches before any Ack: each follows the one before it.
+    assert_eq!(cursors(&mut s, &mut log), [(0, Some(0)), (1, Some(1)), (2, Some(2))]);
+
+    // A new session starts from the server's mark.
+    s.on_disconnected();
+    let again = welcome(&log, EPOCH, ACTIVE, [1, 0, 0], [0; 3]);
+    connect(&mut s, &mut log, again);
+    s.on_message(credit(Class::P0, 1_000), &mut log).unwrap();
+    assert_eq!(cursors(&mut s, &mut log), [(1, Some(1)), (2, Some(2))]);
+
+    // A Rewind puts it back to where the server asked from.
+    s.on_message(rewind(1), &mut log).unwrap();
+    s.on_message(credit(Class::P0, 1_000), &mut log).unwrap();
+    assert_eq!(cursors(&mut s, &mut log), [(1, Some(1)), (2, Some(2))]);
+
+    // A new epoch starts from nothing.
+    s.on_disconnected();
+    let new_epoch = welcome(&log, [0xe2; 16], ACTIVE, [0; 3], [0; 3]);
+    connect(&mut s, &mut log, new_epoch);
+    s.on_message(credit(Class::P0, 1_000), &mut log).unwrap();
+    assert_eq!(cursors(&mut s, &mut log), [(0, Some(0)), (1, Some(1)), (2, Some(2))]);
+}
+
+#[test]
+fn a_batch_after_dropped_sequences_states_the_cursor_below_its_first_sequence() {
+    // The device says it stepped over the sequences itself. The server would otherwise have
+    // to guess whether they were skipped or are still on their way.
+    let mut s = session();
+    let mut log = log_with(2, 0);
+    fresh(&mut s, &mut log);
+    s.on_message(credit(Class::P0, 150), &mut log).unwrap();
+    assert_eq!(cursors(&mut s, &mut log), [(0, Some(0)), (1, Some(1))]);
+
+    log.skip(Class::P0, 5).unwrap();
+    log.append(Class::P0, 0, [9; 16], 1, &[9; 100]).unwrap();
+    log.append(Class::P0, 0, [10; 16], 1, &[10; 100]).unwrap();
+    s.on_message(credit(Class::P0, 1_000), &mut log).unwrap();
+    assert_eq!(cursors(&mut s, &mut log), [(7, Some(2)), (8, Some(8))]);
+}
+
+#[test]
+fn a_batch_after_evicted_frames_states_the_cursor_below_its_first_sequence() {
+    let mut s = session();
+    let mut log = log_with(5, 0);
+    fresh(&mut s, &mut log);
+    s.on_message(credit(Class::P0, 100), &mut log).unwrap();
+    assert_eq!(cursors(&mut s, &mut log), [(0, Some(0))]);
+
+    // Frames 1 and 2 are evicted before they were sent.
+    let front = log.front_frames(Class::P0, 480).unwrap();
+    assert_eq!(front.last().unwrap().end_seq(), 3);
+    log.evict_through(Class::P0, front.last().unwrap().next_offset).unwrap();
+    s.on_message(credit(Class::P0, 1_000), &mut log).unwrap();
+    assert_eq!(cursors(&mut s, &mut log), [(3, Some(1)), (4, Some(4))]);
+}
+
+#[test]
+fn a_batch_after_a_rotted_frame_states_the_cursor_below_its_first_sequence() {
+    let mut s = session();
+    let mut log = log_with(3, 0);
+    fresh(&mut s, &mut log);
+    // The payload of the second frame rots.
+    let second = log.front_frames(Class::P0, u64::MAX).unwrap()[1];
+    log.storage_mut().corrupt(Class::P0, second.next_offset - 1);
+    s.on_message(credit(Class::P0, 1_000), &mut log).unwrap();
+    assert_eq!(cursors(&mut s, &mut log), [(0, Some(0)), (2, Some(1))]);
+}
+
 #[test]
 fn credit_decides_what_is_sent_and_the_reported_state_does_not() {
     // The server withholds credit from a device it will not take data from. A state this

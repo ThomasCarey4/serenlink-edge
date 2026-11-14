@@ -47,6 +47,7 @@ fn every_body() -> Vec<Body> {
             hash: vec![3; 16],
             block: vec![4; 300],
             chain: vec![5; 16],
+            cursor_seq: Some(96),
         }),
         Body::Ack(Ack {
             class: 0,
@@ -77,6 +78,27 @@ fn unknown_fields_are_skipped() {
     // Field 99, varint wire type, value 1: something a newer peer might add.
     bytes.extend_from_slice(&[0x98, 0x06, 0x01]);
     assert_eq!(Envelope::decode(bytes.as_slice()).unwrap(), env);
+}
+
+#[test]
+fn a_batch_says_whether_it_states_its_cursor() {
+    let batch = |cursor_seq| Batch {
+        class: 1,
+        first_seq: 7,
+        count: 2,
+        cursor_seq,
+        ..Batch::default()
+    };
+    // A cursor at zero is still a statement, and is not the same as saying nothing.
+    let stated = Envelope::of(Body::Batch(batch(Some(0)))).encode_to_vec();
+    let silent = Envelope::of(Body::Batch(batch(None))).encode_to_vec();
+    assert_ne!(stated, silent);
+    for (bytes, cursor_seq) in [(stated, Some(0)), (silent, None)] {
+        let Some(Body::Batch(back)) = Envelope::decode(bytes.as_slice()).unwrap().body else {
+            panic!("expected a Batch");
+        };
+        assert_eq!(back.cursor_seq, cursor_seq);
+    }
 }
 
 #[test]
