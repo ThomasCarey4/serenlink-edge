@@ -311,7 +311,8 @@ pub struct DurableLog<S: Storage> {
     /// Trims since the metadata was last written.
     unsaved_trims: u32,
     /// Losses found by reading, and whether a durable gap declares them yet. Kept in RAM:
-    /// after a restart the rot is still on disk and `open` finds it again.
+    /// after a restart the rot is still on disk and `open` finds it again, because the
+    /// stored backup mark never passes a loss that is not declared.
     rot: Vec<(LostRange, bool)>,
     /// One past the highest sequence trimmed from the front of each class, as far as this
     /// boot knows: the backup mark the metadata held at open, then each trim.
@@ -554,13 +555,13 @@ impl<S: Storage> DurableLog<S> {
     ///
     /// The marks are bounded by what this log has written (`backed_up_next` ≤
     /// `committed_next` ≤ next sequence), so no claim by a server can reach records that
-    /// do not exist yet. The caller checks them against what was actually sent.
+    /// do not exist yet. The caller checks them against what was actually sent. The backup
+    /// mark is also held at the first loss of the class that no durable gap declares yet.
     pub fn ack(&mut self, class: Class, committed_next: u64, backed_up_next: u64) -> Result<(), StorageError> {
         let i = class.index();
         let committed_next = committed_next.min(self.next_seq[i]);
         let backed_up_next = backed_up_next.min(committed_next);
         self.meta.committed_next[i] = committed_next;
-        self.meta.backed_up_next[i] = self.meta.backed_up_next[i].max(backed_up_next);
         // Nothing from an undeclared loss onwards goes until a durable gap declares it.
         let undeclared = self
             .rot
@@ -568,6 +569,14 @@ impl<S: Storage> DurableLog<S> {
             .filter(|(lost, declared)| lost.class == class && !declared)
             .map(|(lost, _)| lost.first_seq)
             .min();
+        // Nor does the backup mark kept here pass it. The server commits across a hole the
+        // upload stepped over, so its mark can lie above a loss it does not hold. After a
+        // restart `open` and `front_seq` take the stored mark as the point below which
+        // nothing is left to declare, and the list of losses, kept in RAM, is gone by then.
+        // The mark catches up with the first ack after the loss is declared.
+        let reference = undeclared.map_or(backed_up_next, |seq| seq.min(backed_up_next));
+        self.meta.backed_up_next[i] = self.meta.backed_up_next[i].max(reference);
+        // A loss found below a mark already kept still holds the trim.
         let limit = undeclared.map_or(self.meta.backed_up_next[i], |seq| seq.min(self.meta.backed_up_next[i]));
 
         // Bytes after the last frame are kept: at run time they can only be a frame whose
@@ -698,6 +707,7 @@ impl<S: Storage> DurableLog<S> {
         self.meta.committed_next[class.index()]
     }
 
+    /// The backup mark this log keeps: the server's, held at the first undeclared loss.
     pub fn backed_up_next(&self, class: Class) -> u64 {
         self.meta.backed_up_next[class.index()]
     }

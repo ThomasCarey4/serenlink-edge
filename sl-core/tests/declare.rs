@@ -580,3 +580,200 @@ fn rot_found_in_a_full_store_is_declared_by_evicting_rather_than_left_blocking_t
         assert!(is_declared(&log, Class::P0, seq), "P0 {seq} lost without a gap");
     }
 }
+
+// The backup mark the log keeps never passes a loss that no durable gap declares
+// (STOR-005). The server commits across a hole the upload stepped over, so its mark can lie
+// above records it does not hold; and after a restart the stored mark is all that says where
+// a loss at the very front of a class begins.
+
+/// Five P2 frames of two records each and one P1 frame. The header of the second P2 frame
+/// (records 2 and 3) has rotted.
+fn log_with_a_rotted_header() -> DurableLog<MemStorage> {
+    let mut log = open(100_000);
+    for k in 0..5u8 {
+        log.append(Class::P2, 0, [k; 16], 2, &[k; 100]).unwrap();
+    }
+    log.append(Class::P1, 0, [9; 16], 1, &[9; 100]).unwrap();
+    log.storage_mut().corrupt(Class::P2, (HEADER_LEN + 100 + 20) as u64);
+    log
+}
+
+const ROT: LostRange = LostRange {
+    class: Class::P2,
+    first_seq: 2,
+    count: 2,
+};
+
+/// Send everything that reads, as a session does.
+fn upload<S: Storage>(log: &mut DurableLog<S>) {
+    for class in Class::ALL {
+        while let Some(frame) = log.peek_unsent(class).unwrap() {
+            log.mark_sent(&frame);
+        }
+    }
+}
+
+/// The server has committed and backed up everything it was sent. Emptying P1 is what makes
+/// the log write its metadata. A failed write is a power cut.
+fn ack_all<S: Storage>(log: &mut DurableLog<S>) -> Result<(), StorageError> {
+    log.ack(Class::P2, 10, 10)?;
+    log.ack(Class::P1, 1, 1)
+}
+
+/// A restart, as a device does it: open, declare what `open` found, then a new session whose
+/// Welcome carries the server's marks. The rot must be declared, or still held, at every step.
+fn restart_and_finish(log: DurableLog<MemStorage>, at: &str) {
+    let mut storage = log.into_storage();
+    storage.power_on();
+    let (mut log, recovery) = DurableLog::open(storage).unwrap();
+    let mut rec = eager();
+    let mut sealed = Vec::new();
+    rec.report_recovery(&recovery, 50, &mut log, &mut sealed).unwrap();
+    let covered = |log: &DurableLog<MemStorage>| is_declared(log, Class::P2, 2) && is_declared(log, Class::P2, 3);
+    let held = |log: &DurableLog<MemStorage>| log.first_retained_seq(Class::P2).unwrap() <= 4;
+
+    ack_all(&mut log).unwrap();
+    assert!(
+        covered(&log) || held(&log),
+        "{at}: trimmed undeclared after the Welcome"
+    );
+    upload(&mut log);
+    rec.tick(60, &mut log, &mut sealed).unwrap();
+    assert!(covered(&log), "{at}: the rot was never declared");
+    ack_all(&mut log).unwrap();
+    assert_eq!(
+        log.first_retained_seq(Class::P2).unwrap(),
+        10,
+        "{at}: the trim never resumed"
+    );
+    assert_eq!(log.backed_up_next(Class::P2), 10, "{at}: the mark never caught up");
+}
+
+#[test]
+fn the_backup_mark_is_held_at_an_undeclared_loss() {
+    let mut log = log_with_a_rotted_header();
+    upload(&mut log);
+    assert_eq!(log.undeclared(), [ROT]);
+
+    ack_all(&mut log).unwrap();
+    assert_eq!(
+        log.first_retained_seq(Class::P2).unwrap(),
+        4,
+        "frame 0..2 went, the rot is in front"
+    );
+    assert_eq!(log.backed_up_next(Class::P2), 2, "held at the rot");
+    assert_eq!(log.committed_next(Class::P2), 10, "the commit mark is the server's");
+    assert_eq!(log.backed_up_next(Class::P1), 1, "another class is not held");
+
+    // Once a durable gap declares the rot, the next ack moves the mark and trims.
+    let mut rec = eager();
+    let mut sealed = Vec::new();
+    rec.tick(5, &mut log, &mut sealed).unwrap();
+    assert_eq!(log.backed_up_next(Class::P2), 2, "only an ack moves it");
+    ack_all(&mut log).unwrap();
+    assert_eq!(log.backed_up_next(Class::P2), 10);
+    assert_eq!(log.first_retained_seq(Class::P2).unwrap(), 10);
+}
+
+#[test]
+fn rot_at_the_front_is_found_again_after_a_restart() {
+    let mut log = log_with_a_rotted_header();
+    upload(&mut log);
+    ack_all(&mut log).unwrap();
+
+    // The crash of STOR-005: the metadata was written by the P1 trim, nothing was declared.
+    let (log, recovery) = reopen(log);
+    assert_eq!(log.backed_up_next(Class::P2), 2, "the stored mark is the held one");
+    assert_eq!(recovery.corrupt, [ROT], "open reports the front loss from the mark");
+    assert_eq!(log.undeclared(), [ROT]);
+    assert_eq!(log.front_seq(Class::P2), 2, "an eviction would declare from the rot on");
+}
+
+#[test]
+fn a_restart_at_any_point_between_rot_and_declaration_loses_nothing_silently() {
+    // Before the upload has seen the rot.
+    restart_and_finish(log_with_a_rotted_header(), "after the rot");
+
+    // After the upload stepped over it.
+    let mut log = log_with_a_rotted_header();
+    upload(&mut log);
+    restart_and_finish(log, "after the upload");
+
+    // After the server's marks passed it.
+    let mut log = log_with_a_rotted_header();
+    upload(&mut log);
+    ack_all(&mut log).unwrap();
+    restart_and_finish(log, "after the ack");
+
+    // After the declaration, before the ack that trims past it.
+    let mut log = log_with_a_rotted_header();
+    upload(&mut log);
+    ack_all(&mut log).unwrap();
+    let mut sealed = Vec::new();
+    eager().tick(5, &mut log, &mut sealed).unwrap();
+    restart_and_finish(log, "after the declaration");
+
+    // After the rot itself has been trimmed.
+    let mut log = log_with_a_rotted_header();
+    upload(&mut log);
+    ack_all(&mut log).unwrap();
+    let mut sealed = Vec::new();
+    eager().tick(5, &mut log, &mut sealed).unwrap();
+    ack_all(&mut log).unwrap();
+    assert_eq!(log.first_retained_seq(Class::P2).unwrap(), 10);
+    restart_and_finish(log, "after the trim");
+}
+
+#[test]
+fn a_power_cut_at_any_byte_of_the_ack_or_the_declaration_loses_nothing_silently() {
+    // The acks write one copy of the metadata; the declaration is one P0 frame.
+    for bytes in 0..=200u64 {
+        let mut log = log_with_a_rotted_header();
+        upload(&mut log);
+        log.storage_mut().cut_power_after(bytes);
+        let _ = ack_all(&mut log);
+        restart_and_finish(log, &format!("ack cut after {bytes} bytes"));
+
+        // The same cut with the previous copy of the metadata already carrying marks.
+        let mut log = log_with_a_rotted_header();
+        upload(&mut log);
+        ack_all(&mut log).unwrap();
+        log.storage_mut().cut_power_after(bytes);
+        let _ = ack_all(&mut log);
+        restart_and_finish(log, &format!("second ack cut after {bytes} bytes"));
+
+        let mut log = log_with_a_rotted_header();
+        upload(&mut log);
+        ack_all(&mut log).unwrap();
+        log.storage_mut().cut_power_after(bytes);
+        let mut sealed = Vec::new();
+        let _ = eager().tick(5, &mut log, &mut sealed);
+        let _ = ack_all(&mut log);
+        restart_and_finish(log, &format!("declaration cut after {bytes} bytes"));
+    }
+}
+
+#[test]
+fn rot_found_on_a_second_pass_holds_the_mark_and_the_trim() {
+    let mut log = open(100_000);
+    for k in 0..3u8 {
+        log.append(Class::P1, 0, [k; 16], 1, &[k; 100]).unwrap();
+    }
+    upload(&mut log);
+    // The server holds all three and has backed up the first. The payload of the second
+    // then rots, and a Rewind sends the upload over it again.
+    log.ack(Class::P1, 3, 1).unwrap();
+    log.storage_mut()
+        .corrupt(Class::P1, (HEADER_LEN + 100 + HEADER_LEN + 10) as u64);
+    log.rewind(Class::P1, 0).unwrap();
+    upload(&mut log);
+    let rot = LostRange {
+        class: Class::P1,
+        first_seq: 1,
+        count: 1,
+    };
+    assert_eq!(log.undeclared(), [rot]);
+    log.ack(Class::P1, 3, 3).unwrap();
+    assert_eq!(log.backed_up_next(Class::P1), 1, "the mark does not pass it");
+    assert_eq!(log.first_retained_seq(Class::P1).unwrap(), 1, "nor does the trim");
+}
