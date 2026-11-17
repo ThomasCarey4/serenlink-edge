@@ -32,13 +32,17 @@ fn connect_with_state(state: DeviceState) -> Session<KeySigner> {
     )
     .unwrap();
     s.on_message(
-        Envelope::of(Body::Welcome(Welcome {
-            protocol_version: 1,
-            state: state as i32,
-            server_time_ms: 0,
-            epoch: vec![4; 16],
-            marks: Vec::new(),
-        })),
+        Envelope::of(Body::Welcome(
+            Welcome {
+                protocol_version: 1,
+                state: state as i32,
+                server_time_ms: 0,
+                epoch: vec![4; 16],
+                marks: Vec::new(),
+                check: Vec::new(),
+            }
+            .with_check(),
+        )),
         &mut log,
     )
     .unwrap();

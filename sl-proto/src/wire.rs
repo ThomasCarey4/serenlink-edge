@@ -72,6 +72,8 @@ pub struct Cursor {
     pub next_seq: u64,
 }
 
+/// Carries no check: the device acts on nothing in it but signing the nonce, and a nonce
+/// damaged on the way only makes the server refuse the signature and close the session.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Challenge {
     #[prost(bytes = "vec", tag = "1")]
@@ -113,9 +115,48 @@ pub struct Welcome {
     pub epoch: Vec<u8>,
     #[prost(message, repeated, tag = "5")]
     pub marks: Vec<Mark>,
+    /// `fields_check` of this Welcome, taken by the server when it sends. The device believes
+    /// the marks and the epoch only when it matches: one flipped bit in a mark's
+    /// `backed_up_next` would otherwise stay inside the bounds of Decision 14 and trim a
+    /// frame no backup holds. A Welcome without it is malformed.
+    #[prost(bytes = "vec", tag = "6")]
+    pub check: Vec<u8>,
 }
 
-/// Server's position for one class. Both values are exclusive.
+impl Welcome {
+    /// First 8 bytes of SHA-256 over every field except `check`, the marks included, under a
+    /// context of its own. Like every check on a message, it guards against damage on the
+    /// way and not against the sender, who can take it over whatever it likes to claim.
+    pub fn fields_check(&self) -> [u8; 8] {
+        checked(b"serenlink-welcome-v1", |hasher| {
+            hasher.update(self.protocol_version.to_le_bytes());
+            hasher.update(self.state.to_le_bytes());
+            hasher.update(self.server_time_ms.to_le_bytes());
+            update_bytes(hasher, &self.epoch);
+            hasher.update((self.marks.len() as u32).to_le_bytes());
+            for mark in &self.marks {
+                hasher.update(mark.class.to_le_bytes());
+                hasher.update(mark.committed_next.to_le_bytes());
+                hasher.update(mark.backed_up_next.to_le_bytes());
+                update_bytes(hasher, &mark.chain);
+            }
+        })
+    }
+
+    /// This Welcome with its check taken over it as it stands.
+    pub fn with_check(mut self) -> Self {
+        self.check = self.fields_check().to_vec();
+        self
+    }
+
+    /// Whether the check is present and matches the other fields.
+    pub fn is_intact(&self) -> bool {
+        self.check == self.fields_check()
+    }
+}
+
+/// Server's position for one class. Both values are exclusive. A mark travels only inside a
+/// Welcome, and the Welcome's check covers it.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Mark {
     #[prost(uint32, tag = "1")]
@@ -173,28 +214,43 @@ impl Batch {
     /// First 8 bytes of SHA-256 over every field except `block` and `check`. It guards
     /// against damage, not against the device, which can state whatever it likes.
     pub fn header_check(&self) -> [u8; 8] {
-        let mut hasher = Sha256::new();
-        hasher.update(b"serenlink-batch-v1");
-        hasher.update(self.class.to_le_bytes());
-        hasher.update(self.first_seq.to_le_bytes());
-        hasher.update(self.count.to_le_bytes());
-        hasher.update(self.format_version.to_le_bytes());
-        hasher.update(self.compression.to_le_bytes());
-        for field in [&self.hash, &self.chain] {
-            hasher.update((field.len() as u32).to_le_bytes());
-            hasher.update(field);
-        }
-        match self.cursor_seq {
-            Some(cursor_seq) => {
-                hasher.update([1]);
-                hasher.update(cursor_seq.to_le_bytes());
+        checked(b"serenlink-batch-v1", |hasher| {
+            hasher.update(self.class.to_le_bytes());
+            hasher.update(self.first_seq.to_le_bytes());
+            hasher.update(self.count.to_le_bytes());
+            hasher.update(self.format_version.to_le_bytes());
+            hasher.update(self.compression.to_le_bytes());
+            for field in [&self.hash, &self.chain] {
+                update_bytes(hasher, field);
             }
-            None => hasher.update([0]),
-        }
-        let mut check = [0u8; 8];
-        check.copy_from_slice(&hasher.finalize()[..8]);
-        check
+            match self.cursor_seq {
+                Some(cursor_seq) => {
+                    hasher.update([1]);
+                    hasher.update(cursor_seq.to_le_bytes());
+                }
+                None => hasher.update([0]),
+            }
+        })
     }
+}
+
+/// The construction every message check shares: the first 8 bytes of SHA-256 over a context
+/// naming the message kind, then the message's fields. Each kind has its own context and none
+/// is a prefix of another, so a check taken over one kind of message never validates
+/// another's fields, even when a flipped bit turns one kind into another on the way.
+fn checked(context: &[u8], fields: impl FnOnce(&mut Sha256)) -> [u8; 8] {
+    let mut hasher = Sha256::new();
+    hasher.update(context);
+    fields(&mut hasher);
+    let mut check = [0u8; 8];
+    check.copy_from_slice(&hasher.finalize()[..8]);
+    check
+}
+
+/// A variable-length field, after its length, so that no byte can move between two fields.
+fn update_bytes(hasher: &mut Sha256, field: &[u8]) {
+    hasher.update((field.len() as u32).to_le_bytes());
+    hasher.update(field);
 }
 
 /// Sequences below `committed_next` are in the database; below `backed_up_next` they are
@@ -207,6 +263,34 @@ pub struct Ack {
     pub committed_next: u64,
     #[prost(uint64, tag = "3")]
     pub backed_up_next: u64,
+    /// `fields_check` of this Ack, taken by the server when it sends. The device trims on
+    /// `backed_up_next`, and one flipped bit there can stay inside the bounds it checks, so
+    /// it acts on an Ack only when this matches. An Ack without it is malformed.
+    #[prost(bytes = "vec", tag = "4")]
+    pub check: Vec<u8>,
+}
+
+impl Ack {
+    /// First 8 bytes of SHA-256 over every field except `check`, under a context of its own.
+    /// Integrity against damage on the way, not authentication.
+    pub fn fields_check(&self) -> [u8; 8] {
+        checked(b"serenlink-ack-v1", |hasher| {
+            hasher.update(self.class.to_le_bytes());
+            hasher.update(self.committed_next.to_le_bytes());
+            hasher.update(self.backed_up_next.to_le_bytes());
+        })
+    }
+
+    /// This Ack with its check taken over it as it stands.
+    pub fn with_check(mut self) -> Self {
+        self.check = self.fields_check().to_vec();
+        self
+    }
+
+    /// Whether the check is present and matches the other fields.
+    pub fn is_intact(&self) -> bool {
+        self.check == self.fields_check()
+    }
 }
 
 /// Server asks for everything from `from_seq` again.
@@ -216,9 +300,38 @@ pub struct Rewind {
     pub class: u32,
     #[prost(uint64, tag = "2")]
     pub from_seq: u64,
+    /// `fields_check` of this Rewind, taken by the server when it sends. The device moves
+    /// its upload cursor only when it matches. A Rewind without it is malformed.
+    #[prost(bytes = "vec", tag = "3")]
+    pub check: Vec<u8>,
 }
 
-/// Adds `bytes` of upload allowance for one class.
+impl Rewind {
+    /// First 8 bytes of SHA-256 over every field except `check`, under a context of its own.
+    /// Integrity against damage on the way, not authentication.
+    pub fn fields_check(&self) -> [u8; 8] {
+        checked(b"serenlink-rewind-v1", |hasher| {
+            hasher.update(self.class.to_le_bytes());
+            hasher.update(self.from_seq.to_le_bytes());
+        })
+    }
+
+    /// This Rewind with its check taken over it as it stands.
+    pub fn with_check(mut self) -> Self {
+        self.check = self.fields_check().to_vec();
+        self
+    }
+
+    /// Whether the check is present and matches the other fields.
+    pub fn is_intact(&self) -> bool {
+        self.check == self.fields_check()
+    }
+}
+
+/// Adds `bytes` of upload allowance for one class. It carries no check because it only
+/// paces: a damaged one lets the device send more or less than the server meant, and every
+/// batch sent is still checked and acknowledged on its own. Nothing is trimmed or skipped on
+/// its word.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Credit {
     #[prost(uint32, tag = "1")]

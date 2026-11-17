@@ -29,6 +29,10 @@ pub enum SessionError {
     BadAck,
     /// A Rewind asked for sequences above the upload cursor: it would skip frames not sent.
     BadRewind,
+    /// A Welcome, Ack or Rewind did not carry the check over its fields, or carried one that
+    /// does not match them: it was damaged on the way, or is malformed. Nothing in it was
+    /// acted on.
+    BadCheck,
     Storage(StorageError),
 }
 
@@ -149,6 +153,12 @@ impl<G: Signer> Session<G> {
                 Ok(vec![Envelope::of(Body::Auth(Auth { signature }))])
             }
             (Phase::AwaitWelcome, Body::Welcome(welcome)) => {
+                // Nothing in a Welcome is believed until its check matches. One flipped bit in
+                // a mark can stay inside every bound below and still trim a frame no backup
+                // holds, and a flipped epoch would throw away the marks altogether.
+                if !welcome.is_intact() {
+                    return Err(SessionError::BadCheck);
+                }
                 if welcome.protocol_version != PROTOCOL_VERSION {
                     return Err(SessionError::BadWelcome);
                 }
@@ -201,6 +211,12 @@ impl<G: Signer> Session<G> {
             // In an active session a message about a class this build does not know is
             // ignored, for the same reason as an unknown message kind.
             (Phase::Active, Body::Ack(ack)) => {
+                // Checked before anything else, the class included: the bounds below hold a
+                // lying server to what it was sent, but a backup mark raised by one flipped
+                // bit can stay inside them and trim a frame no backup holds (ADV-005).
+                if !ack.is_intact() {
+                    return Err(SessionError::BadCheck);
+                }
                 let Some(class) = Class::from_u32(ack.class) else {
                     return Ok(Vec::new());
                 };
@@ -211,6 +227,9 @@ impl<G: Signer> Session<G> {
                 Ok(Vec::new())
             }
             (Phase::Active, Body::Rewind(rewind)) => {
+                if !rewind.is_intact() {
+                    return Err(SessionError::BadCheck);
+                }
                 let Some(class) = Class::from_u32(rewind.class) else {
                     return Ok(Vec::new());
                 };

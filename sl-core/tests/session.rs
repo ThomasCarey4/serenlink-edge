@@ -56,13 +56,17 @@ fn welcome(
                 .unwrap_or_default(),
         })
         .to_vec();
-    Envelope::of(Body::Welcome(Welcome {
-        protocol_version: 1,
-        state,
-        server_time_ms: 0,
-        epoch: epoch.to_vec(),
-        marks,
-    }))
+    Envelope::of(Body::Welcome(
+        Welcome {
+            protocol_version: 1,
+            state,
+            server_time_ms: 0,
+            epoch: epoch.to_vec(),
+            marks,
+            check: Vec::new(),
+        }
+        .with_check(),
+    ))
 }
 
 fn credit(class: Class, bytes: u64) -> Envelope {
@@ -95,11 +99,15 @@ fn fresh(s: &mut Session<KeySigner>, log: &mut DurableLog<MemStorage>) {
 }
 
 fn ack(committed_next: u64, backed_up_next: u64) -> Envelope {
-    Envelope::of(Body::Ack(Ack {
-        class: 0,
-        committed_next,
-        backed_up_next,
-    }))
+    Envelope::of(Body::Ack(
+        Ack {
+            class: 0,
+            committed_next,
+            backed_up_next,
+            check: Vec::new(),
+        }
+        .with_check(),
+    ))
 }
 
 fn batches(out: Vec<Envelope>) -> Vec<Batch> {
@@ -312,13 +320,19 @@ fn a_rewind_sends_from_the_requested_sequence_again() {
     fresh(&mut s, &mut log);
     s.on_message(credit(Class::P0, 10_000), &mut log).unwrap();
     sent(&mut s, &mut log);
-    s.on_message(Envelope::of(Body::Rewind(Rewind { class: 0, from_seq: 1 })), &mut log)
-        .unwrap();
+    s.on_message(rewind(1), &mut log).unwrap();
     assert_eq!(sent(&mut s, &mut log), [(0, 1), (0, 2)]);
 }
 
 fn rewind(from_seq: u64) -> Envelope {
-    Envelope::of(Body::Rewind(Rewind { class: 0, from_seq }))
+    Envelope::of(Body::Rewind(
+        Rewind {
+            class: 0,
+            from_seq,
+            check: Vec::new(),
+        }
+        .with_check(),
+    ))
 }
 
 #[test]
@@ -504,12 +518,23 @@ fn messages_this_build_does_not_know_are_ignored_once_active() {
     fresh(&mut s, &mut log);
     let unknown_class = [
         Envelope::of(Body::Credit(Credit { class: 7, bytes: 1 })),
-        Envelope::of(Body::Rewind(Rewind { class: 7, from_seq: 0 })),
-        Envelope::of(Body::Ack(Ack {
-            class: 7,
-            committed_next: 5,
-            backed_up_next: 5,
-        })),
+        Envelope::of(Body::Rewind(
+            Rewind {
+                class: 7,
+                from_seq: 0,
+                check: Vec::new(),
+            }
+            .with_check(),
+        )),
+        Envelope::of(Body::Ack(
+            Ack {
+                class: 7,
+                committed_next: 5,
+                backed_up_next: 5,
+                check: Vec::new(),
+            }
+            .with_check(),
+        )),
         // What a message kind added later decodes to.
         Envelope::default(),
     ];
@@ -539,17 +564,23 @@ fn messages_out_of_place_are_errors() {
     assert_eq!(s.on_message(long_nonce, &mut log), Err(SessionError::BadChallenge));
     s.on_message(challenge(), &mut log).unwrap();
 
-    let short_epoch = Envelope::of(Body::Welcome(Welcome {
-        protocol_version: 1,
-        epoch: vec![1; 4],
-        ..Welcome::default()
-    }));
+    let short_epoch = Envelope::of(Body::Welcome(
+        Welcome {
+            protocol_version: 1,
+            epoch: vec![1; 4],
+            ..Welcome::default()
+        }
+        .with_check(),
+    ));
     assert_eq!(s.on_message(short_epoch, &mut log), Err(SessionError::BadWelcome));
-    let version_not_offered = Envelope::of(Body::Welcome(Welcome {
-        protocol_version: 2,
-        epoch: EPOCH.to_vec(),
-        ..Welcome::default()
-    }));
+    let version_not_offered = Envelope::of(Body::Welcome(
+        Welcome {
+            protocol_version: 2,
+            epoch: EPOCH.to_vec(),
+            ..Welcome::default()
+        }
+        .with_check(),
+    ));
     assert_eq!(
         s.on_message(version_not_offered, &mut log),
         Err(SessionError::BadWelcome)
@@ -568,13 +599,17 @@ fn welcome_with_chain(committed_next: u64, backed_up_next: u64, chain: &[u8]) ->
         backed_up_next,
         chain: chain.to_vec(),
     };
-    Envelope::of(Body::Welcome(Welcome {
-        protocol_version: 1,
-        state: ACTIVE,
-        server_time_ms: 0,
-        epoch: EPOCH.to_vec(),
-        marks: vec![mark],
-    }))
+    Envelope::of(Body::Welcome(
+        Welcome {
+            protocol_version: 1,
+            state: ACTIVE,
+            server_time_ms: 0,
+            epoch: EPOCH.to_vec(),
+            marks: vec![mark],
+            check: Vec::new(),
+        }
+        .with_check(),
+    ))
 }
 
 fn challenge() -> Envelope {
@@ -679,4 +714,149 @@ fn a_mark_in_a_hole_of_the_log_is_answered_with_a_resync() {
     let out = reconnect(&mut s, &mut log, welcome_with_chain(8, 8, &[0x99; 16])).unwrap();
     assert_eq!(out, [Envelope::of(Body::Resync(Resync {}))]);
     assert_eq!(log.read_all(Class::P0).unwrap().len(), 3);
+}
+
+/// The same message with its check taken away, as a server that predates it would send it.
+fn without_check(mut msg: Envelope) -> Envelope {
+    match msg.body.as_mut() {
+        Some(Body::Ack(a)) => a.check.clear(),
+        Some(Body::Rewind(r)) => r.check.clear(),
+        Some(Body::Welcome(w)) => w.check.clear(),
+        other => panic!("no check on {other:?}"),
+    }
+    msg
+}
+
+/// The same message with `change` made to it on the way, after its check was taken.
+fn damaged<F: FnOnce(&mut Body)>(mut msg: Envelope, change: F) -> Envelope {
+    change(msg.body.as_mut().unwrap());
+    msg
+}
+
+#[test]
+fn an_ack_is_acted_on_only_with_its_check() {
+    // ADV-005: one bit flipped on the way raised the backup mark inside the bounds the
+    // device checks, and the device trimmed a frame no backup held.
+    let mut s = session();
+    let mut log = log_with(4, 0);
+    fresh(&mut s, &mut log);
+    s.on_message(credit(Class::P0, 1_000), &mut log).unwrap();
+    assert_eq!(sent(&mut s, &mut log).len(), 4);
+    s.on_message(ack(4, 1), &mut log).unwrap();
+    assert_eq!(log.read_all(Class::P0).unwrap().len(), 3);
+
+    let flipped = damaged(ack(4, 1), |b| {
+        if let Body::Ack(a) = b {
+            a.backed_up_next = 3;
+        }
+    });
+    let wrong = damaged(ack(4, 3), |b| {
+        if let Body::Ack(a) = b {
+            a.check[0] ^= 1;
+        }
+    });
+    for bad in [without_check(ack(4, 3)), flipped, wrong] {
+        assert_eq!(s.on_message(bad, &mut log), Err(SessionError::BadCheck));
+        assert_eq!(log.read_all(Class::P0).unwrap().len(), 3, "nothing trimmed");
+        assert_eq!(log.backed_up_next(Class::P0), 1);
+    }
+
+    s.on_message(ack(4, 3), &mut log).unwrap();
+    assert_eq!(log.read_all(Class::P0).unwrap().len(), 1);
+}
+
+#[test]
+fn an_ack_for_a_class_this_build_does_not_know_is_still_checked() {
+    let mut s = session();
+    let mut log = log_with(1, 0);
+    fresh(&mut s, &mut log);
+    let unknown = Envelope::of(Body::Ack(Ack {
+        class: 7,
+        committed_next: 5,
+        backed_up_next: 5,
+        check: Vec::new(),
+    }));
+    assert_eq!(s.on_message(unknown, &mut log), Err(SessionError::BadCheck));
+}
+
+#[test]
+fn a_rewind_is_acted_on_only_with_its_check() {
+    let mut s = session();
+    let mut log = log_with(4, 0);
+    fresh(&mut s, &mut log);
+    s.on_message(credit(Class::P0, 200), &mut log).unwrap();
+    assert_eq!(sent(&mut s, &mut log), [(0, 0), (0, 1)]);
+
+    let flipped = damaged(rewind(1), |b| {
+        if let Body::Rewind(r) = b {
+            r.from_seq = 0;
+        }
+    });
+    let wrong = damaged(rewind(0), |b| {
+        if let Body::Rewind(r) = b {
+            r.check[7] ^= 0x80;
+        }
+    });
+    for bad in [without_check(rewind(0)), flipped, wrong] {
+        assert_eq!(s.on_message(bad, &mut log), Err(SessionError::BadCheck));
+    }
+    // The cursor has not moved.
+    s.on_message(credit(Class::P0, 100), &mut log).unwrap();
+    assert_eq!(sent(&mut s, &mut log), [(0, 2)]);
+
+    s.on_message(rewind(0), &mut log).unwrap();
+    s.on_message(credit(Class::P0, 1_000), &mut log).unwrap();
+    assert_eq!(sent(&mut s, &mut log), [(0, 0), (0, 1), (0, 2), (0, 3)]);
+}
+
+#[test]
+fn a_welcome_is_believed_only_with_its_check() {
+    let mut s = session();
+    let mut log = log_with(3, 0);
+    fresh(&mut s, &mut log);
+    s.on_message(credit(Class::P0, 1_000), &mut log).unwrap();
+    assert_eq!(sent(&mut s, &mut log).len(), 3);
+    let chain = log.read_all(Class::P0).unwrap()[2].header.chain;
+
+    // A mark's backup raised by a flip, the epoch changed, the check missing or wrong.
+    let backed_up = damaged(welcome_with_chain(3, 1, &chain), |b| {
+        if let Body::Welcome(w) = b {
+            w.marks[0].backed_up_next = 3;
+        }
+    });
+    let epoch = damaged(welcome_with_chain(3, 1, &chain), |b| {
+        if let Body::Welcome(w) = b {
+            w.epoch[0] ^= 1;
+        }
+    });
+    let wrong = damaged(welcome_with_chain(3, 3, &chain), |b| {
+        if let Body::Welcome(w) = b {
+            w.check[3] ^= 4;
+        }
+    });
+    for bad in [without_check(welcome_with_chain(3, 3, &chain)), backed_up, epoch, wrong] {
+        assert_eq!(reconnect(&mut s, &mut log, bad), Err(SessionError::BadCheck));
+        assert_eq!(s.phase(), Phase::AwaitWelcome);
+        assert_eq!(log.epoch(), Some(EPOCH), "the epoch is kept");
+        assert_eq!(log.read_all(Class::P0).unwrap().len(), 3, "nothing trimmed");
+        assert_eq!(log.backed_up_next(Class::P0), 0);
+    }
+
+    let out = reconnect(&mut s, &mut log, welcome_with_chain(3, 1, &chain)).unwrap();
+    assert!(out.is_empty());
+    assert_eq!(s.phase(), Phase::Active);
+    assert_eq!(log.read_all(Class::P0).unwrap().len(), 2);
+}
+
+#[test]
+fn a_first_welcome_is_believed_only_with_its_check() {
+    // A first Welcome trims nothing, but it names the epoch the device adopts for good.
+    let mut s = session();
+    let mut log = log_with(2, 0);
+    s.on_connected(&log).unwrap();
+    s.on_message(challenge(), &mut log).unwrap();
+    let bad = without_check(welcome(&log, EPOCH, ACTIVE, [0; 3], [0; 3]));
+    assert_eq!(s.on_message(bad, &mut log), Err(SessionError::BadCheck));
+    assert_eq!(log.epoch(), None);
+    assert_eq!(s.phase(), Phase::AwaitWelcome);
 }

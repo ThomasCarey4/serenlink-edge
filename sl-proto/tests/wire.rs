@@ -37,6 +37,7 @@ fn every_body() -> Vec<Body> {
                 backed_up_next: 30,
                 chain: vec![6; 16],
             }],
+            check: vec![7; 8],
         }),
         Body::Batch(Batch {
             class: 2,
@@ -54,8 +55,13 @@ fn every_body() -> Vec<Body> {
             class: 0,
             committed_next: 112,
             backed_up_next: 100,
+            check: vec![8; 8],
         }),
-        Body::Rewind(Rewind { class: 1, from_seq: 77 }),
+        Body::Rewind(Rewind {
+            class: 1,
+            from_seq: 77,
+            check: vec![9; 8],
+        }),
         Body::Credit(Credit {
             class: 0,
             bytes: 65_536,
@@ -175,6 +181,217 @@ fn the_header_check_covers_every_field_but_the_block() {
     b.block.clear();
     b.check = vec![1; 8];
     assert_eq!(b.header_check(), base);
+}
+
+fn sample_ack() -> Ack {
+    Ack {
+        class: 1,
+        committed_next: 35,
+        backed_up_next: 33,
+        check: Vec::new(),
+    }
+}
+
+fn sample_rewind() -> Rewind {
+    Rewind {
+        class: 2,
+        from_seq: 300,
+        check: Vec::new(),
+    }
+}
+
+fn sample_welcome() -> Welcome {
+    Welcome {
+        protocol_version: PROTOCOL_VERSION,
+        state: DeviceState::Hold as i32,
+        server_time_ms: 258,
+        epoch: vec![2; 16],
+        marks: vec![
+            Mark {
+                class: 0,
+                committed_next: 40,
+                backed_up_next: 30,
+                chain: vec![6; 16],
+            },
+            Mark {
+                class: 2,
+                committed_next: 0,
+                backed_up_next: 0,
+                chain: Vec::new(),
+            },
+        ],
+        check: Vec::new(),
+    }
+}
+
+/// What the Ack check is taken over, byte for byte. A server built from another copy of this
+/// code must arrive at the same bytes.
+#[test]
+fn the_ack_check_is_frozen() {
+    use sha2::{Digest, Sha256};
+    let expected: Vec<u8> = [
+        b"serenlink-ack-v1".as_slice(),
+        &[1, 0, 0, 0],
+        &[35, 0, 0, 0, 0, 0, 0, 0],
+        &[33, 0, 0, 0, 0, 0, 0, 0],
+    ]
+    .concat();
+    assert_eq!(sample_ack().fields_check()[..], Sha256::digest(&expected)[..8]);
+}
+
+/// What the Rewind check is taken over, byte for byte.
+#[test]
+fn the_rewind_check_is_frozen() {
+    use sha2::{Digest, Sha256};
+    let expected: Vec<u8> = [
+        b"serenlink-rewind-v1".as_slice(),
+        &[2, 0, 0, 0],
+        &[44, 1, 0, 0, 0, 0, 0, 0],
+    ]
+    .concat();
+    assert_eq!(sample_rewind().fields_check()[..], Sha256::digest(&expected)[..8]);
+}
+
+/// What the Welcome check is taken over, byte for byte, marks included.
+#[test]
+fn the_welcome_check_is_frozen() {
+    use sha2::{Digest, Sha256};
+    let expected: Vec<u8> = [
+        b"serenlink-welcome-v1".as_slice(),
+        &[1, 0, 0, 0],
+        &[2, 0, 0, 0],
+        &[2, 1, 0, 0, 0, 0, 0, 0],
+        &[16, 0, 0, 0],
+        &[2; 16],
+        &[2, 0, 0, 0],
+        &[0, 0, 0, 0],
+        &[40, 0, 0, 0, 0, 0, 0, 0],
+        &[30, 0, 0, 0, 0, 0, 0, 0],
+        &[16, 0, 0, 0],
+        &[6; 16],
+        &[2, 0, 0, 0],
+        &[0, 0, 0, 0, 0, 0, 0, 0],
+        &[0, 0, 0, 0, 0, 0, 0, 0],
+        &[0, 0, 0, 0],
+    ]
+    .concat();
+    assert_eq!(sample_welcome().fields_check()[..], Sha256::digest(&expected)[..8]);
+}
+
+#[test]
+fn the_ack_check_covers_every_field() {
+    let base = sample_ack().fields_check();
+    let changes: [fn(&mut Ack); 3] = [
+        |a| a.class = 0,
+        |a| a.committed_next ^= 1,
+        // ADV-005: the flip that raised the backup mark from 33 to 35.
+        |a| a.backed_up_next = 35,
+    ];
+    for change in changes {
+        let mut a = sample_ack();
+        change(&mut a);
+        assert_ne!(a.fields_check(), base);
+    }
+    let mut a = sample_ack();
+    a.check = vec![1; 8];
+    assert_eq!(a.fields_check(), base, "the check does not cover itself");
+}
+
+#[test]
+fn the_rewind_check_covers_every_field() {
+    let base = sample_rewind().fields_check();
+    let changes: [fn(&mut Rewind); 2] = [|r| r.class = 0, |r| r.from_seq = 301];
+    for change in changes {
+        let mut r = sample_rewind();
+        change(&mut r);
+        assert_ne!(r.fields_check(), base);
+    }
+}
+
+#[test]
+fn the_welcome_check_covers_every_field_and_every_mark() {
+    let base = sample_welcome().fields_check();
+    let changes: [fn(&mut Welcome); 11] = [
+        |w| w.protocol_version = 2,
+        |w| w.state = DeviceState::Active as i32,
+        |w| w.server_time_ms = 259,
+        |w| w.epoch[15] ^= 1,
+        |w| w.marks[0].class = 1,
+        |w| w.marks[0].committed_next = 41,
+        |w| w.marks[0].backed_up_next = 40,
+        |w| w.marks[0].chain[0] ^= 0x80,
+        |w| w.marks[1].committed_next = 1,
+        |w| {
+            w.marks.pop();
+        },
+        |w| w.marks.swap(0, 1),
+    ];
+    for change in changes {
+        let mut w = sample_welcome();
+        change(&mut w);
+        assert_ne!(w.fields_check(), base);
+    }
+    // A byte cannot move from the epoch into a mark's chain unseen.
+    let mut w = sample_welcome();
+    let byte = w.epoch.pop().unwrap();
+    w.marks[1].chain.push(byte);
+    assert_ne!(w.fields_check(), base);
+}
+
+#[test]
+fn a_message_is_intact_only_with_its_own_check() {
+    assert!(!sample_ack().is_intact(), "a missing check is not intact");
+    assert!(sample_ack().with_check().is_intact());
+    assert!(sample_rewind().with_check().is_intact());
+    assert!(sample_welcome().with_check().is_intact());
+    let mut ack = sample_ack().with_check();
+    ack.check[7] ^= 1;
+    assert!(!ack.is_intact());
+}
+
+/// An Ack and a Rewind with the same leading fields, or a Batch, never share a check: one kind
+/// turned into another by a flipped tag on the way does not pass as the other.
+#[test]
+fn each_kind_of_check_is_domain_separated() {
+    let ack = Ack {
+        class: 1,
+        committed_next: 0,
+        backed_up_next: 0,
+        check: Vec::new(),
+    };
+    let rewind = Rewind {
+        class: 1,
+        from_seq: 0,
+        check: Vec::new(),
+    };
+    let batch = Batch {
+        class: 1,
+        ..Batch::default()
+    };
+    let welcome = Welcome::default();
+    let checks = [
+        ack.fields_check(),
+        rewind.fields_check(),
+        batch.header_check(),
+        welcome.fields_check(),
+    ];
+    for (i, a) in checks.iter().enumerate() {
+        for b in &checks[i + 1..] {
+            assert_ne!(a, b);
+        }
+    }
+    // A Rewind's bytes read as an Ack (envelope tag 7 flipped to 6) bring the Rewind's check
+    // into the Ack's place for it, and it does not match.
+    let mut bytes = Envelope::of(Body::Rewind(sample_rewind().with_check())).encode_to_vec();
+    assert_eq!(bytes[0], (7 << 3) | 2);
+    bytes[0] = (6 << 3) | 2;
+    match Envelope::decode(bytes.as_slice()) {
+        Ok(Envelope {
+            body: Some(Body::Ack(a)),
+        }) => assert!(!a.is_intact()),
+        Ok(other) => panic!("read as {other:?}"),
+        Err(_) => {}
+    }
 }
 
 #[test]
