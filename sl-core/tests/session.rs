@@ -204,8 +204,27 @@ fn a_frame_larger_than_the_credit_still_goes() {
     assert_eq!(sent(&mut s, &mut log), [(0, 0)], "one frame, and the credit is used up");
     assert!(s.poll(&mut log).unwrap().is_empty());
 
-    s.on_message(credit(Class::P0, 30), &mut log).unwrap();
+    // The frame cost its whole length, 100: the balance is -70, and the server hands back
+    // the whole length when it commits.
+    s.on_message(credit(Class::P0, 100), &mut log).unwrap();
     assert_eq!(sent(&mut s, &mut log), [(0, 1), (1, 0)]);
+}
+
+#[test]
+fn the_balance_is_the_credit_received_less_the_bytes_sent_and_can_go_below_zero() {
+    // The server counts the same way, so a device that sends only on a positive balance is
+    // never closed for want of credit, whatever is still on its way to it.
+    let mut s = session();
+    let mut log = log_with(3, 0);
+    fresh(&mut s, &mut log);
+    s.on_message(credit(Class::P0, 150), &mut log).unwrap();
+    assert_eq!(sent(&mut s, &mut log), [(0, 0), (0, 1)], "150, then 50, then -50");
+    s.on_message(credit(Class::P0, 49), &mut log).unwrap();
+    assert!(s.poll(&mut log).unwrap().is_empty(), "-1");
+    s.on_message(credit(Class::P0, 1), &mut log).unwrap();
+    assert!(s.poll(&mut log).unwrap().is_empty(), "0 is no credit");
+    s.on_message(credit(Class::P0, 1), &mut log).unwrap();
+    assert_eq!(sent(&mut s, &mut log), [(0, 2)], "1 lets one frame go");
 }
 
 #[test]

@@ -62,7 +62,9 @@ pub struct Session<G: Signer> {
     signer: G,
     phase: Phase,
     state: DeviceState,
-    credit: [u64; 3],
+    /// The allowance per class as a balance: a frame costs its whole length, and any balance
+    /// above zero lets one frame go, so it can fall below zero by less than one frame.
+    credit: [i64; 3],
     /// One past the highest sequence the server can hold in this session, per class: its
     /// mark at the Welcome, then the end of each batch sent. An Ack beyond it is a lie.
     /// Everything held between the mark and here has been sent: the cursor starts at the
@@ -247,7 +249,7 @@ impl<G: Signer> Session<G> {
             (Phase::Active, Body::Credit(credit)) => {
                 if let Some(class) = Class::from_u32(credit.class) {
                     let i = class.index();
-                    self.credit[i] = self.credit[i].saturating_add(credit.bytes);
+                    self.credit[i] = self.credit[i].saturating_add(i64::try_from(credit.bytes).unwrap_or(i64::MAX));
                 }
                 Ok(Vec::new())
             }
@@ -267,11 +269,14 @@ impl<G: Signer> Session<G> {
             while let Some(frame) = log.peek_unsent(class)? {
                 // A class that still has data blocks every class below it. Any credit at all
                 // lets one frame go, however large: a frame bigger than the whole allowance
-                // would otherwise never be sent, and would block everything behind it.
-                if out.len() >= self.cfg.max_batches_per_poll || self.credit[i] == 0 {
+                // would otherwise never be sent, and would block everything behind it. The
+                // frame costs its whole length, as the server counts it, so the balance can
+                // go below zero; the server hands the whole length back when it commits.
+                if out.len() >= self.cfg.max_batches_per_poll || self.credit[i] <= 0 {
                     return Ok(out);
                 }
-                self.credit[i] = self.credit[i].saturating_sub(frame.payload.len() as u64);
+                let cost = i64::try_from(frame.payload.len()).unwrap_or(i64::MAX);
+                self.credit[i] = self.credit[i].saturating_sub(cost);
                 self.sent_next[i] = self.sent_next[i].max(frame.end_seq());
                 let cursor_seq = self.cursor[i];
                 self.cursor[i] = frame.end_seq();
