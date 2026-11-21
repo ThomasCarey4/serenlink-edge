@@ -146,7 +146,7 @@ fn hello_describes_the_device_and_what_it_holds() {
 }
 
 #[test]
-fn the_challenge_is_answered_with_a_signature_over_nonce_device_and_host() {
+fn the_challenge_is_answered_with_a_signature_over_nonce_device_host_and_binding() {
     let mut s = session();
     let mut log = log_with(0, 0);
     s.on_connected(&log, [0xB1; 32]).unwrap();
