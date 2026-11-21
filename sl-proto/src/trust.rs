@@ -94,17 +94,17 @@ impl TrustStore {
 
     /// `next`, if this store's keys signed it and it is newer (spec 5.2).
     pub fn accept_successor(&self, next: &SignedTrustStore) -> Result<TrustStore, TrustError> {
-        // Parse and bound the body, and compare versions, before the key lookup: a stale
-        // store is `NotNewer` whichever key signed it.
-        let store = next.open_unverified()?;
-        if store.version <= self.version {
-            return Err(TrustError::NotNewer);
-        }
+        // Authenticate first: nothing is decoded beyond the size cap until a current key
+        // has signed it.
         let key = self
             .release_key(next.release_key_id)
             .ok_or(TrustError::UnknownReleaseKey)?;
         if !verify(&key, &message(&next.body), &next.sig) {
             return Err(TrustError::BadSignature);
+        }
+        let store = next.open_unverified()?;
+        if store.version <= self.version {
+            return Err(TrustError::NotNewer);
         }
         Ok(store)
     }

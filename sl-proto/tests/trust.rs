@@ -126,8 +126,11 @@ fn a_successor_must_be_newer_and_signed_by_a_current_key() {
     let v3s = SignedTrustStore::sign(&v3, 2, &K2);
     assert_eq!(v1.accept_successor(&v3s), Err(TrustError::UnknownReleaseKey));
     assert_eq!(got2.accept_successor(&v3s).unwrap(), v3);
-    // Not newer.
-    assert_eq!(v3.accept_successor(&v2s), Err(TrustError::NotNewer));
+    // v2s is signed by K1, which v3 lacks.
+    assert_eq!(v3.accept_successor(&v2s), Err(TrustError::UnknownReleaseKey));
+    // Not newer, signed by a key v3 holds.
+    let v2_by_k2 = SignedTrustStore::sign(&v2, 2, &K2);
+    assert_eq!(v3.accept_successor(&v2_by_k2), Err(TrustError::NotNewer));
     assert_eq!(v2.accept_successor(&v2s), Err(TrustError::NotNewer));
 }
 
@@ -154,5 +157,42 @@ fn a_baseline_must_verify_under_itself() {
     assert_eq!(
         SignedTrustStore::from_bytes(&bytes).unwrap().open_baseline().unwrap(),
         v1
+    );
+}
+
+#[test]
+fn a_wrong_signature_or_garbage_body_is_refused() {
+    let v1 = store(1, &[(1, K1)], 1, &[]);
+    let v2 = store(2, &[(1, K1)], 1, &[]);
+    // Right key id, signed by another key.
+    assert_eq!(
+        v1.accept_successor(&SignedTrustStore::sign(&v2, 1, &K2)),
+        Err(TrustError::BadSignature)
+    );
+    // Correctly signed garbage: sign a body that is not a TrustStore.
+    let mut garbage = SignedTrustStore::sign(&v2, 1, &K1);
+    garbage.body = vec![0xff; 8];
+    let key = ed25519_dalek::SigningKey::from_bytes(&K1);
+    let msg = sl_proto::lp::signed_message(b"serenlink-trust-store-v1", &[&garbage.body]);
+    use ed25519_dalek::Signer as _;
+    garbage.sig = key.sign(&msg).to_bytes().to_vec();
+    assert_eq!(v1.accept_successor(&garbage), Err(TrustError::Malformed));
+}
+
+#[test]
+fn an_oversized_encoding_or_version_zero_is_bounds() {
+    let big = vec![0u8; sl_proto::trust::MAX_TRUST_STORE_BYTES + 1];
+    assert_eq!(SignedTrustStore::from_bytes(&big), Err(TrustError::Bounds));
+    let v0 = SignedTrustStore::sign(&store(0, &[(1, K1)], 1, &[]), 1, &K1);
+    assert_eq!(v0.open_unverified(), Err(TrustError::Bounds));
+}
+
+#[test]
+fn the_minimum_serial_itself_is_accepted() {
+    let s = store(1, &[(1, K1)], 5, &[]);
+    assert_eq!(check(&s, &identity(5, HOST, 1, &K1), [1; 32], HOST), Ok(()));
+    assert_eq!(
+        check(&s, &identity(4, HOST, 1, &K1), [1; 32], HOST),
+        Err(IdentityError::Revoked)
     );
 }

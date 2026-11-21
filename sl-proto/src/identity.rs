@@ -193,6 +193,9 @@ impl ServerIdentity {
 
 /// The device's check of a Challenge (spec 3.3, steps 2 to 5), against its own binding,
 /// nonce, id and hostname. Nothing is signed by the device unless this is `Ok`.
+///
+/// Hostnames compare exactly, so case-sensitively: the caller passes the configured hostname
+/// as written in the certificate (lower case, no trailing dot, per spec 4).
 pub fn verify_identity(
     store: &crate::trust::TrustStore,
     cert: &[u8],
