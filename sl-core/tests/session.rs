@@ -1,7 +1,11 @@
+mod common;
+
+use common::keys;
 use sl_core::log::DurableLog;
 use sl_core::mem_storage::MemStorage;
 use sl_core::session::{Phase, Session, SessionConfig, SessionError};
 use sl_proto::auth::{KeySigner, Signer, auth_message, verify};
+use sl_proto::identity::ServerIdentity;
 use sl_proto::ids::Class;
 use sl_proto::wire::{Ack, Batch, Body, Challenge, Credit, DeviceState, Envelope, Mark, Resync, Rewind, Welcome};
 
@@ -9,17 +13,34 @@ const DEVICE: [u8; 16] = [0xd1; 16];
 const HOST: &str = "ingest.example";
 const EPOCH: [u8; 16] = [0xe1; 16];
 
-fn session() -> Session<KeySigner> {
-    let cfg = SessionConfig {
+fn cfg() -> SessionConfig {
+    SessionConfig {
         device_id: DEVICE,
         hostname: HOST.into(),
         firmware_version: 1,
         config_version: 2,
         table_version: 3,
-        trust_version: 4,
         max_batches_per_poll: 8,
-    };
-    Session::new(cfg, KeySigner::from_seed([5; 32]))
+    }
+}
+
+fn session() -> Session<KeySigner> {
+    Session::new(cfg(), KeySigner::from_seed([5; 32]), keys::store(1, &[]))
+}
+
+/// A Challenge with nonce `[7; 32]`, proved by `id` for `binding` and `host`.
+fn challenge_from(id: &ServerIdentity, binding: [u8; 32], host: &str) -> Envelope {
+    let nonce = [7u8; 32];
+    Envelope::of(Body::Challenge(Challenge {
+        nonce: nonce.to_vec(),
+        identity_cert: id.cert().to_vec(),
+        identity_sig: id.sign_challenge(&binding, &nonce, &DEVICE, host).to_vec(),
+    }))
+}
+
+/// The Challenge an honest server sends on binding `[0xB1; 32]`.
+fn challenge() -> Envelope {
+    challenge_from(&keys::identity(1, HOST, &keys::RELEASE), [0xB1; 32], HOST)
 }
 
 fn log_with(p0: u8, p1: u8) -> DurableLog<MemStorage> {
@@ -79,14 +100,7 @@ fn credit(class: Class, bytes: u64) -> Envelope {
 /// Run the handshake to `Active` with the given Welcome.
 fn connect(s: &mut Session<KeySigner>, log: &mut DurableLog<MemStorage>, welcome: Envelope) {
     s.on_connected(log, [0xB1; 32]).unwrap();
-    s.on_message(
-        Envelope::of(Body::Challenge(Challenge {
-            nonce: vec![7; 32],
-            ..Challenge::default()
-        })),
-        log,
-    )
-    .unwrap();
+    s.on_message(challenge(), log).unwrap();
     assert!(s.on_message(welcome, log).unwrap().is_empty());
     assert_eq!(s.phase(), Phase::Active);
 }
@@ -150,11 +164,7 @@ fn the_challenge_is_answered_with_a_signature_over_nonce_device_host_and_binding
     let mut s = session();
     let mut log = log_with(0, 0);
     s.on_connected(&log, [0xB1; 32]).unwrap();
-    let challenge = Envelope::of(Body::Challenge(Challenge {
-        nonce: vec![7; 32],
-        ..Challenge::default()
-    }));
-    let out = s.on_message(challenge, &mut log).unwrap();
+    let out = s.on_message(challenge(), &mut log).unwrap();
 
     let [
         Envelope {
@@ -631,13 +641,6 @@ fn welcome_with_chain(committed_next: u64, backed_up_next: u64, chain: &[u8]) ->
     ))
 }
 
-fn challenge() -> Envelope {
-    Envelope::of(Body::Challenge(Challenge {
-        nonce: vec![7; 32],
-        ..Challenge::default()
-    }))
-}
-
 #[test]
 fn a_batch_carries_the_chain_of_its_frame() {
     let mut s = session();
@@ -885,15 +888,7 @@ fn the_auth_signs_the_channel_binding() {
     let mut s = session();
     let mut log = log_with(0, 0);
     s.on_connected(&log, [0xB1; 32]).unwrap();
-    let out = s
-        .on_message(
-            Envelope::of(Body::Challenge(Challenge {
-                nonce: vec![7; 32],
-                ..Challenge::default()
-            })),
-            &mut log,
-        )
-        .unwrap();
+    let out = s.on_message(challenge(), &mut log).unwrap();
     let Some(Body::Auth(auth)) = &out[0].body else {
         panic!("expected an Auth")
     };
@@ -908,4 +903,97 @@ fn the_auth_signs_the_channel_binding() {
         &auth_message(&[7; 32], &DEVICE, HOST, &[0xB2; 32]),
         &auth.signature
     ));
+}
+
+fn refused(challenge: Envelope) {
+    let mut s = session();
+    let mut log = log_with(0, 0);
+    s.on_connected(&log, [0xB1; 32]).unwrap();
+    assert_eq!(s.on_message(challenge, &mut log), Err(SessionError::BadIdentity));
+    assert_eq!(s.phase(), Phase::AwaitChallenge);
+}
+
+#[test]
+fn an_honest_challenge_is_answered() {
+    let mut s = session();
+    let mut log = log_with(0, 0);
+    s.on_connected(&log, [0xB1; 32]).unwrap();
+    let out = s
+        .on_message(
+            challenge_from(&keys::identity(1, HOST, &keys::RELEASE), [0xB1; 32], HOST),
+            &mut log,
+        )
+        .unwrap();
+    assert!(matches!(out[0].body, Some(Body::Auth(_))));
+}
+
+#[test]
+fn a_relayed_challenge_is_refused() {
+    refused(challenge_from(
+        &keys::identity(1, HOST, &keys::RELEASE),
+        [0xB2; 32],
+        HOST,
+    ));
+}
+
+#[test]
+fn a_rogue_certificate_is_refused() {
+    refused(challenge_from(&keys::identity(1, HOST, &keys::ROGUE), [0xB1; 32], HOST));
+}
+
+#[test]
+fn a_revoked_certificate_is_refused() {
+    let mut s = Session::new(cfg(), KeySigner::from_seed([5; 32]), keys::store(2, &[]));
+    let mut log = log_with(0, 0);
+    s.on_connected(&log, [0xB1; 32]).unwrap();
+    let c = challenge_from(&keys::identity(1, HOST, &keys::RELEASE), [0xB1; 32], HOST);
+    assert_eq!(s.on_message(c, &mut log), Err(SessionError::BadIdentity));
+
+    let mut s = Session::new(cfg(), KeySigner::from_seed([5; 32]), keys::store(1, &[3]));
+    s.on_connected(&log, [0xB1; 32]).unwrap();
+    let c = challenge_from(&keys::identity(3, HOST, &keys::RELEASE), [0xB1; 32], HOST);
+    assert_eq!(s.on_message(c, &mut log), Err(SessionError::BadIdentity));
+}
+
+#[test]
+fn a_certificate_for_another_host_is_refused() {
+    refused(challenge_from(
+        &keys::identity(1, "other.test", &keys::RELEASE),
+        [0xB1; 32],
+        "other.test",
+    ));
+}
+
+#[test]
+fn a_challenge_without_a_proof_is_refused() {
+    refused(Envelope::of(Body::Challenge(Challenge {
+        nonce: vec![7; 32],
+        ..Challenge::default()
+    })));
+}
+
+#[test]
+fn the_hello_names_the_trust_store_version() {
+    let mut s = session();
+    let log = log_with(0, 0);
+    let Some(Body::Hello(h)) = s.on_connected(&log, [0xB1; 32]).unwrap().body else {
+        panic!("expected Hello");
+    };
+    assert_eq!(h.trust_version, 1);
+    let mut newer = keys::store(1, &[]);
+    newer.version = 7;
+    s.set_trust(newer);
+    let Some(Body::Hello(h)) = s.on_connected(&log, [0xB1; 32]).unwrap().body else {
+        panic!("expected Hello");
+    };
+    assert_eq!(h.trust_version, 7);
+}
+
+#[test]
+fn a_trust_store_set_later_is_the_one_checked() {
+    let mut s = session();
+    let mut log = log_with(0, 0);
+    s.set_trust(keys::store(2, &[]));
+    s.on_connected(&log, [0xB1; 32]).unwrap();
+    assert_eq!(s.on_message(challenge(), &mut log), Err(SessionError::BadIdentity));
 }

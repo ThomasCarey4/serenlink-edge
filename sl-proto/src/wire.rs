@@ -72,15 +72,18 @@ pub struct Cursor {
     pub next_seq: u64,
 }
 
-/// Carries no check: the device acts on nothing in it but signing the nonce, and a nonce
-/// damaged on the way only makes the server refuse the signature and close the session.
+/// Carries no check: the signature covers everything the device acts on (spec 3.1).
+/// Tag 2 (`server_identity_proof`, never filled) is retired and must not be reused.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Challenge {
     #[prost(bytes = "vec", tag = "1")]
     pub nonce: Vec<u8>,
-    /// Server identity key and its signature by the release key. Verified from part C on.
-    #[prost(bytes = "vec", tag = "2")]
-    pub server_identity_proof: Vec<u8>,
+    /// A `SignedIdentityCert`.
+    #[prost(bytes = "vec", tag = "3")]
+    pub identity_cert: Vec<u8>,
+    /// The identity key's signature over `identity::server_message`.
+    #[prost(bytes = "vec", tag = "4")]
+    pub identity_sig: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

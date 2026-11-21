@@ -23,7 +23,8 @@ fn every_body() -> Vec<Body> {
         }),
         Body::Challenge(Challenge {
             nonce: vec![7; 32],
-            server_identity_proof: vec![8; 4],
+            identity_cert: vec![8; 4],
+            identity_sig: vec![10; 64],
         }),
         Body::Auth(Auth { signature: vec![9; 64] }),
         Body::Welcome(Welcome {

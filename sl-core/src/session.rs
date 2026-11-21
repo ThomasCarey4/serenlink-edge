@@ -3,7 +3,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use sl_proto::auth::{Signer, auth_message};
+use sl_proto::identity::verify_identity;
 use sl_proto::ids::Class;
+use sl_proto::trust::TrustStore;
 use sl_proto::wire::{Auth, Batch, Body, Cursor, DeviceState, Envelope, Hello, PROTOCOL_VERSION, Resync};
 
 use crate::log::{DurableLog, Lineage};
@@ -23,6 +25,8 @@ pub enum SessionError {
     Unexpected,
     /// The Challenge did not carry a 32-byte nonce.
     BadChallenge,
+    /// The Challenge's server identity did not verify (spec 3.3): nothing was signed.
+    BadIdentity,
     /// The Welcome was malformed, or named a protocol version that was not offered.
     BadWelcome,
     /// An Ack claimed more than this session has sent, or more backed up than committed.
@@ -50,7 +54,6 @@ pub struct SessionConfig {
     pub firmware_version: u32,
     pub config_version: u32,
     pub table_version: u32,
-    pub trust_version: u32,
     /// Upper bound on batches produced by one `poll`.
     pub max_batches_per_poll: usize,
 }
@@ -60,6 +63,9 @@ pub struct SessionConfig {
 pub struct Session<G: Signer> {
     cfg: SessionConfig,
     signer: G,
+    /// The active trust store: what a Challenge's certificate is checked against, and whose
+    /// version the Hello names.
+    trust: TrustStore,
     phase: Phase,
     state: DeviceState,
     /// The allowance per class as a balance: a frame costs its whole length, and any balance
@@ -81,10 +87,11 @@ pub struct Session<G: Signer> {
 }
 
 impl<G: Signer> Session<G> {
-    pub fn new(cfg: SessionConfig, signer: G) -> Self {
+    pub fn new(cfg: SessionConfig, signer: G, trust: TrustStore) -> Self {
         Self {
             cfg,
             signer,
+            trust,
             phase: Phase::Disconnected,
             state: DeviceState::Unclaimed,
             credit: [0; 3],
@@ -92,6 +99,11 @@ impl<G: Signer> Session<G> {
             cursor: [0; 3],
             binding: [0; 32],
         }
+    }
+
+    /// After the shell's `TrustAnchor` accepted a new store.
+    pub fn set_trust(&mut self, trust: TrustStore) {
+        self.trust = trust;
     }
 
     pub fn phase(&self) -> Phase {
@@ -130,7 +142,7 @@ impl<G: Signer> Session<G> {
             firmware_version: self.cfg.firmware_version,
             config_version: self.cfg.config_version,
             table_version: self.cfg.table_version,
-            trust_version: self.cfg.trust_version,
+            trust_version: self.trust.version,
         })))
     }
 
@@ -156,10 +168,24 @@ impl<G: Signer> Session<G> {
         match (self.phase, body) {
             (Phase::AwaitChallenge, Body::Challenge(challenge)) => {
                 // A fixed size, so that this is not a service that signs anything it is sent.
-                if challenge.nonce.len() != 32 {
-                    return Err(SessionError::BadChallenge);
-                }
-                let message = auth_message(&challenge.nonce, &self.cfg.device_id, &self.cfg.hostname, &self.binding);
+                let nonce: [u8; 32] = challenge
+                    .nonce
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| SessionError::BadChallenge)?;
+                // The server proves, for this channel, a key our release keys certified;
+                // until it has, this device signs nothing and believes nothing (spec 3.3).
+                verify_identity(
+                    &self.trust,
+                    &challenge.identity_cert,
+                    &challenge.identity_sig,
+                    &self.binding,
+                    &nonce,
+                    &self.cfg.device_id,
+                    &self.cfg.hostname,
+                )
+                .map_err(|_| SessionError::BadIdentity)?;
+                let message = auth_message(&nonce, &self.cfg.device_id, &self.cfg.hostname, &self.binding);
                 let signature = self.signer.sign(&message).to_vec();
                 self.phase = Phase::AwaitWelcome;
                 Ok(vec![Envelope::of(Body::Auth(Auth { signature }))])
