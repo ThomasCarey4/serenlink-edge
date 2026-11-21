@@ -40,7 +40,10 @@ fn a_cert_with_a_changed_body_does_not_verify() {
     let mut signed = SignedIdentityCert::sign(&cert(7), 1, &RELEASE);
     let last = signed.body.len() - 1;
     signed.body[last] ^= 1;
-    assert!(verify_cert_signature(&signed, &public(&RELEASE)).is_err());
+    assert_eq!(
+        verify_cert_signature(&signed, &public(&RELEASE)),
+        Err(IdentityError::BadSignature)
+    );
 }
 
 #[test]
@@ -106,4 +109,30 @@ fn server_message_is_fixed() {
         want.extend_from_slice(f);
     }
     assert_eq!(m, want);
+}
+
+#[test]
+fn from_bytes_accepts_exactly_the_cap_and_classifies_garbage() {
+    // 1024 bytes of 0xff: past the size check, and not a message.
+    assert_eq!(
+        SignedIdentityCert::from_bytes(&[0xffu8; 1024]),
+        Err(IdentityError::Malformed)
+    );
+}
+
+#[test]
+fn malformed_certificate_bodies_are_bounds_errors() {
+    let bad = |c: IdentityCert| {
+        let signed = SignedIdentityCert::sign(&c, 1, &RELEASE);
+        verify_cert_signature(&signed, &public(&RELEASE))
+    };
+    let mut c = cert(1);
+    c.identity_pubkey = vec![1; 31];
+    assert_eq!(bad(c), Err(IdentityError::Bounds));
+    let mut c = cert(1);
+    c.hostnames = vec![String::new()];
+    assert_eq!(bad(c), Err(IdentityError::Bounds));
+    let mut c = cert(1);
+    c.hostnames = vec![];
+    assert_eq!(bad(c), Err(IdentityError::Bounds));
 }

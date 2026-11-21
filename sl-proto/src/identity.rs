@@ -32,6 +32,7 @@ pub struct SignedIdentityCert {
     /// An encoded `IdentityCert`, exactly as signed.
     #[prost(bytes = "vec", tag = "1")]
     pub body: Vec<u8>,
+    /// Not covered by the signature: it only selects which release key to verify with.
     #[prost(uint32, tag = "2")]
     pub release_key_id: u32,
     #[prost(bytes = "vec", tag = "3")]
@@ -77,7 +78,8 @@ impl IdentityCert {
         if ok { Ok(()) } else { Err(IdentityError::Bounds) }
     }
 
-    pub fn pubkey(&self) -> [u8; 32] {
+    /// The identity key. Panics unless the key is 32 bytes: call only after `check_bounds`.
+    pub(crate) fn pubkey(&self) -> [u8; 32] {
         let mut out = [0u8; 32];
         out.copy_from_slice(&self.identity_pubkey);
         out
@@ -119,7 +121,12 @@ pub fn verify_cert_signature(
     if !verify(release_pubkey, &cert_message(&signed.body), &signed.sig) {
         return Err(IdentityError::BadSignature);
     }
-    let cert = IdentityCert::decode(signed.body.as_slice()).map_err(|_| IdentityError::Malformed)?;
+    parse_body(&signed.body)
+}
+
+/// Decode a certificate body and check it against the bounds of spec 4.
+fn parse_body(body: &[u8]) -> Result<IdentityCert, IdentityError> {
+    let cert = IdentityCert::decode(body).map_err(|_| IdentityError::Malformed)?;
     cert.check_bounds()?;
     Ok(cert)
 }
@@ -127,7 +134,7 @@ pub fn verify_cert_signature(
 /// The gateway's identity key and its certificate. The key never leaves this value.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ServerIdentity {
-    seed: [u8; 32],
+    key: SigningKey,
     cert: Vec<u8>,
     serial: u64,
     hostnames: Vec<String>,
@@ -148,13 +155,13 @@ impl ServerIdentity {
     /// given one).
     pub fn new(seed: [u8; 32], cert: Vec<u8>) -> Result<Self, IdentityError> {
         let signed = SignedIdentityCert::from_bytes(&cert)?;
-        let body = IdentityCert::decode(signed.body.as_slice()).map_err(|_| IdentityError::Malformed)?;
-        body.check_bounds()?;
-        if body.pubkey() != SigningKey::from_bytes(&seed).verifying_key().to_bytes() {
+        let body = parse_body(&signed.body)?;
+        let key = SigningKey::from_bytes(&seed);
+        if body.pubkey() != key.verifying_key().to_bytes() {
             return Err(IdentityError::KeyMismatch);
         }
         Ok(Self {
-            seed,
+            key,
             cert,
             serial: body.serial,
             hostnames: body.hostnames,
@@ -166,7 +173,7 @@ impl ServerIdentity {
     }
 
     pub fn public_key(&self) -> [u8; 32] {
-        SigningKey::from_bytes(&self.seed).verifying_key().to_bytes()
+        self.key.verifying_key().to_bytes()
     }
 
     pub fn serial(&self) -> u64 {
@@ -178,7 +185,7 @@ impl ServerIdentity {
     }
 
     pub fn sign_challenge(&self, binding: &[u8; 32], nonce: &[u8; 32], device_id: &[u8], hostname: &str) -> [u8; 64] {
-        SigningKey::from_bytes(&self.seed)
+        self.key
             .sign(&server_message(binding, nonce, device_id, hostname))
             .to_bytes()
     }
