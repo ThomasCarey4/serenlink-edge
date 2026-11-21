@@ -2,14 +2,14 @@ use alloc::vec::Vec;
 
 use sl_proto::ids::Class;
 
-use crate::storage::{Storage, StorageError};
+use crate::storage::{META_SLOTS, Storage, StorageError};
 
 /// In-memory `Storage` for tests and the simulator, with power-cut and corruption injection.
 #[derive(Clone, Debug)]
 pub struct MemStorage {
     data: [Vec<u8>; 3],
     start: [u64; 3],
-    meta: [Option<Vec<u8>>; 2],
+    meta: [Option<Vec<u8>>; META_SLOTS],
     capacity: u64,
     cut_after: Option<u64>,
     dead: bool,
@@ -21,7 +21,7 @@ impl MemStorage {
         Self {
             data: [Vec::new(), Vec::new(), Vec::new()],
             start: [0; 3],
-            meta: [None, None],
+            meta: Default::default(),
             capacity,
             cut_after: None,
             dead: false,
@@ -129,11 +129,11 @@ impl Storage for MemStorage {
     }
 
     fn read_meta(&self, slot: usize) -> Result<Option<Vec<u8>>, StorageError> {
-        Ok(self.meta[slot].clone())
+        self.meta.get(slot).cloned().ok_or(StorageError::Io)
     }
 
     fn write_meta(&mut self, slot: usize, data: &[u8]) -> Result<(), StorageError> {
-        if self.dead {
+        if self.dead || slot >= META_SLOTS {
             return Err(StorageError::Io);
         }
         let n = self.allowed(data.len());

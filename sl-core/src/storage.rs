@@ -12,7 +12,11 @@ pub enum StorageError {
     Io,
 }
 
-/// Three append-only byte logs, one per class, plus two small metadata slots.
+/// Small metadata slots `Storage` holds: 0 and 1 are the log's (`Meta`), 2 and 3 the trust
+/// store's (`TrustAnchor`).
+pub const META_SLOTS: usize = 4;
+
+/// Three append-only byte logs, one per class, plus `META_SLOTS` small metadata slots.
 ///
 /// This is the contract the in-memory store and a file store meet. Raw flash cannot meet it
 /// as written; what has to change for that is listed at the end of the part A plan.
@@ -34,6 +38,8 @@ pub trait Storage {
     fn trim_front(&mut self, class: Class, new_start: u64) -> Result<(), StorageError>;
     /// Discard everything from `new_end` on.
     fn truncate(&mut self, class: Class, new_end: u64) -> Result<(), StorageError>;
+    /// `slot` is below `META_SLOTS`.
     fn read_meta(&self, slot: usize) -> Result<Option<Vec<u8>>, StorageError>;
+    /// `slot` is below `META_SLOTS`.
     fn write_meta(&mut self, slot: usize, data: &[u8]) -> Result<(), StorageError>;
 }

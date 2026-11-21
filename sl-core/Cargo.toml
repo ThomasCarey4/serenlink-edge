@@ -7,12 +7,14 @@ description = "SerenLink edge engine: durable log, recorder and upload session"
 
 [features]
 default = ["std"]
-std = ["sl-proto/std"]
+std = ["sl-proto/std", "sha2/std"]
 zstd = ["std", "sl-proto/zstd"]
 
 [dependencies]
 sl-proto = { workspace = true }
 crc32fast = { version = "1", default-features = false }
+sha2 = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 proptest = "1"
+ed25519-dalek = "2"

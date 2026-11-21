@@ -625,7 +625,9 @@ name = "sl-core"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "ed25519-dalek",
  "proptest",
+ "sha2",
  "sl-proto",
 ]
 
