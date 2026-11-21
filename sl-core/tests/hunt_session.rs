@@ -27,7 +27,7 @@ fn connect_with_state(state: DeviceState) -> Session<KeySigner> {
     let (mut log, _) = DurableLog::open(MemStorage::new(1 << 16)).unwrap();
     let mut s = session();
     let id = keys::identity(1, "ingest.example", &keys::RELEASE);
-    s.on_connected(&log, [0xB1; 32]).unwrap();
+    s.on_connected(&log, [0xB1; 32], 0).unwrap();
     s.on_message(
         Envelope::of(Body::Challenge(Challenge {
             nonce: NONCE.to_vec(),

@@ -99,7 +99,7 @@ fn credit(class: Class, bytes: u64) -> Envelope {
 
 /// Run the handshake to `Active` with the given Welcome.
 fn connect(s: &mut Session<KeySigner>, log: &mut DurableLog<MemStorage>, welcome: Envelope) {
-    s.on_connected(log, [0xB1; 32]).unwrap();
+    s.on_connected(log, [0xB1; 32], 0).unwrap();
     s.on_message(challenge(), log).unwrap();
     assert!(s.on_message(welcome, log).unwrap().is_empty());
     assert_eq!(s.phase(), Phase::Active);
@@ -146,7 +146,7 @@ fn hello_describes_the_device_and_what_it_holds() {
     let mut log = log_with(3, 1);
     log.ack(Class::P0, 1, 1).unwrap();
 
-    let Some(Body::Hello(hello)) = s.on_connected(&log, [0xB1; 32]).unwrap().body else {
+    let Some(Body::Hello(hello)) = s.on_connected(&log, [0xB1; 32], 0).unwrap().body else {
         panic!("expected Hello");
     };
     assert_eq!(hello.device_id, DEVICE);
@@ -163,7 +163,7 @@ fn hello_describes_the_device_and_what_it_holds() {
 fn the_challenge_is_answered_with_a_signature_over_nonce_device_host_and_binding() {
     let mut s = session();
     let mut log = log_with(0, 0);
-    s.on_connected(&log, [0xB1; 32]).unwrap();
+    s.on_connected(&log, [0xB1; 32], 0).unwrap();
     let out = s.on_message(challenge(), &mut log).unwrap();
 
     let [
@@ -583,7 +583,7 @@ fn messages_out_of_place_are_errors() {
         Err(SessionError::Unexpected)
     );
 
-    s.on_connected(&log, [0xB1; 32]).unwrap();
+    s.on_connected(&log, [0xB1; 32], 0).unwrap();
     let no_nonce = Envelope::of(Body::Challenge(Challenge::default()));
     assert_eq!(s.on_message(no_nonce, &mut log), Err(SessionError::BadChallenge));
     let long_nonce = Envelope::of(Body::Challenge(Challenge {
@@ -673,7 +673,7 @@ fn a_welcome_that_contradicts_the_log_is_answered_with_a_resync() {
 
     // Same epoch and a mark at the end of our log, but for content we never sent: the
     // sign of another device with our identity. Skipping to the mark would lose our data.
-    s.on_connected(&log, [0xB1; 32]).unwrap();
+    s.on_connected(&log, [0xB1; 32], 0).unwrap();
     s.on_message(challenge(), &mut log).unwrap();
     let out = s.on_message(welcome_with_chain(3, 0, &[0xaa; 16]), &mut log).unwrap();
     assert_eq!(out, [Envelope::of(Body::Resync(Resync {}))]);
@@ -698,7 +698,7 @@ fn reconnect(
     welcome: Envelope,
 ) -> Result<Vec<Envelope>, SessionError> {
     s.on_disconnected();
-    s.on_connected(log, [0xB1; 32]).unwrap();
+    s.on_connected(log, [0xB1; 32], 0).unwrap();
     s.on_message(challenge(), log).unwrap();
     s.on_message(welcome, log)
 }
@@ -875,7 +875,7 @@ fn a_first_welcome_is_believed_only_with_its_check() {
     // A first Welcome trims nothing, but it names the epoch the device adopts for good.
     let mut s = session();
     let mut log = log_with(2, 0);
-    s.on_connected(&log, [0xB1; 32]).unwrap();
+    s.on_connected(&log, [0xB1; 32], 0).unwrap();
     s.on_message(challenge(), &mut log).unwrap();
     let bad = without_check(welcome(&log, EPOCH, ACTIVE, [0; 3], [0; 3]));
     assert_eq!(s.on_message(bad, &mut log), Err(SessionError::BadCheck));
@@ -887,7 +887,7 @@ fn a_first_welcome_is_believed_only_with_its_check() {
 fn the_auth_signs_the_channel_binding() {
     let mut s = session();
     let mut log = log_with(0, 0);
-    s.on_connected(&log, [0xB1; 32]).unwrap();
+    s.on_connected(&log, [0xB1; 32], 0).unwrap();
     let out = s.on_message(challenge(), &mut log).unwrap();
     let Some(Body::Auth(auth)) = &out[0].body else {
         panic!("expected an Auth")
@@ -908,7 +908,7 @@ fn the_auth_signs_the_channel_binding() {
 fn refused(challenge: Envelope) {
     let mut s = session();
     let mut log = log_with(0, 0);
-    s.on_connected(&log, [0xB1; 32]).unwrap();
+    s.on_connected(&log, [0xB1; 32], 0).unwrap();
     assert_eq!(s.on_message(challenge, &mut log), Err(SessionError::BadIdentity));
     assert_eq!(s.phase(), Phase::AwaitChallenge);
 }
@@ -917,7 +917,7 @@ fn refused(challenge: Envelope) {
 fn an_honest_challenge_is_answered() {
     let mut s = session();
     let mut log = log_with(0, 0);
-    s.on_connected(&log, [0xB1; 32]).unwrap();
+    s.on_connected(&log, [0xB1; 32], 0).unwrap();
     let out = s
         .on_message(
             challenge_from(&keys::identity(1, HOST, &keys::RELEASE), [0xB1; 32], HOST),
@@ -945,12 +945,12 @@ fn a_rogue_certificate_is_refused() {
 fn a_revoked_certificate_is_refused() {
     let mut s = Session::new(cfg(), KeySigner::from_seed([5; 32]), keys::store(2, &[]));
     let mut log = log_with(0, 0);
-    s.on_connected(&log, [0xB1; 32]).unwrap();
+    s.on_connected(&log, [0xB1; 32], 0).unwrap();
     let c = challenge_from(&keys::identity(1, HOST, &keys::RELEASE), [0xB1; 32], HOST);
     assert_eq!(s.on_message(c, &mut log), Err(SessionError::BadIdentity));
 
     let mut s = Session::new(cfg(), KeySigner::from_seed([5; 32]), keys::store(1, &[3]));
-    s.on_connected(&log, [0xB1; 32]).unwrap();
+    s.on_connected(&log, [0xB1; 32], 0).unwrap();
     let c = challenge_from(&keys::identity(3, HOST, &keys::RELEASE), [0xB1; 32], HOST);
     assert_eq!(s.on_message(c, &mut log), Err(SessionError::BadIdentity));
 }
@@ -976,14 +976,14 @@ fn a_challenge_without_a_proof_is_refused() {
 fn the_hello_names_the_trust_store_version() {
     let mut s = session();
     let log = log_with(0, 0);
-    let Some(Body::Hello(h)) = s.on_connected(&log, [0xB1; 32]).unwrap().body else {
+    let Some(Body::Hello(h)) = s.on_connected(&log, [0xB1; 32], 0).unwrap().body else {
         panic!("expected Hello");
     };
     assert_eq!(h.trust_version, 1);
     let mut newer = keys::store(1, &[]);
     newer.version = 7;
     s.set_trust(newer);
-    let Some(Body::Hello(h)) = s.on_connected(&log, [0xB1; 32]).unwrap().body else {
+    let Some(Body::Hello(h)) = s.on_connected(&log, [0xB1; 32], 0).unwrap().body else {
         panic!("expected Hello");
     };
     assert_eq!(h.trust_version, 7);
@@ -994,6 +994,73 @@ fn a_trust_store_set_later_is_the_one_checked() {
     let mut s = session();
     let mut log = log_with(0, 0);
     s.set_trust(keys::store(2, &[]));
-    s.on_connected(&log, [0xB1; 32]).unwrap();
+    s.on_connected(&log, [0xB1; 32], 0).unwrap();
     assert_eq!(s.on_message(challenge(), &mut log), Err(SessionError::BadIdentity));
+}
+
+/// A fresh-epoch Welcome stamped with the server's clock `server_time_ms`.
+fn welcome_at(server_time_ms: u64) -> Envelope {
+    Envelope::of(Body::Welcome(
+        Welcome {
+            protocol_version: 1,
+            state: ACTIVE,
+            server_time_ms,
+            epoch: EPOCH.to_vec(),
+            marks: Vec::new(),
+            check: Vec::new(),
+        }
+        .with_check(),
+    ))
+}
+
+#[test]
+fn quality_is_the_log2_of_the_round_trip() {
+    use sl_core::session::anchor_quality;
+    assert_eq!(anchor_quality(0), 0);
+    assert_eq!(anchor_quality(1), 1);
+    assert_eq!(anchor_quality(3), 2);
+    assert_eq!(anchor_quality(1023), 10);
+    assert_eq!(anchor_quality(1024), 11);
+    assert_eq!(anchor_quality(u64::MAX), 64);
+}
+
+#[test]
+fn an_authenticated_welcome_gives_a_server_anchor() {
+    use sl_core::session::anchor_quality;
+    use sl_proto::record::AnchorSource;
+    let mut s = session();
+    let mut log = log_with(0, 0);
+    s.on_connected(&log, [0xB1; 32], 10_000).unwrap();
+    s.on_message(challenge(), &mut log).unwrap();
+    s.on_message(welcome_at(1_767_225_600_000), &mut log).unwrap();
+    let a = s.take_anchor(10_300).expect("an anchor");
+    assert_eq!(a.mono_ms, 10_300);
+    assert_eq!(a.utc_ms, 1_767_225_600_000);
+    assert_eq!(a.source, AnchorSource::Server);
+    assert_eq!(a.quality, anchor_quality(300));
+    assert_eq!(s.take_anchor(10_400), None, "taken once");
+}
+
+#[test]
+fn a_zero_server_time_gives_no_anchor() {
+    let mut s = session();
+    let mut log = log_with(0, 0);
+    s.on_connected(&log, [0xB1; 32], 10_000).unwrap();
+    s.on_message(challenge(), &mut log).unwrap();
+    s.on_message(welcome_at(0), &mut log).unwrap();
+    assert_eq!(s.take_anchor(10_300), None);
+}
+
+#[test]
+fn a_welcome_that_fails_its_check_gives_no_anchor() {
+    let mut s = session();
+    let mut log = log_with(0, 0);
+    s.on_connected(&log, [0xB1; 32], 10_000).unwrap();
+    s.on_message(challenge(), &mut log).unwrap();
+    let mut bad = welcome_at(1_767_225_600_000);
+    if let Some(Body::Welcome(w)) = &mut bad.body {
+        w.server_time_ms += 1; // the check no longer matches
+    }
+    assert_eq!(s.on_message(bad, &mut log), Err(SessionError::BadCheck));
+    assert_eq!(s.take_anchor(10_300), None);
 }

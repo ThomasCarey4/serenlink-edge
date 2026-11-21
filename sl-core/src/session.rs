@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 use sl_proto::auth::{Signer, auth_message};
 use sl_proto::identity::verify_identity;
 use sl_proto::ids::Class;
+use sl_proto::record::{AnchorSource, TimeAnchor};
 use sl_proto::trust::TrustStore;
 use sl_proto::wire::{Auth, Batch, Body, Cursor, DeviceState, Envelope, Hello, PROTOCOL_VERSION, Resync};
 
@@ -84,6 +85,18 @@ pub struct Session<G: Signer> {
     /// The RFC 9266 tls-exporter value of the connection the session is on, which its Auth
     /// signs.
     binding: [u8; 32],
+    /// The monotonic time the Hello went out, which starts the round trip a server anchor's
+    /// quality is measured by.
+    hello_at_ms: u64,
+    /// The server's wall clock from the Welcome of this authenticated session, until the
+    /// shell takes it as an anchor.
+    server_time: Option<u64>,
+}
+
+/// The uncertainty of a server anchor whose round trip took `rtt_ms`, on a log2 scale:
+/// `ceil(log2(rtt_ms + 1))`, so 0 under 1 ms and 10 for about a second (spec 6).
+pub fn anchor_quality(rtt_ms: u64) -> u8 {
+    (u64::BITS - rtt_ms.leading_zeros()) as u8
 }
 
 impl<G: Signer> Session<G> {
@@ -98,6 +111,8 @@ impl<G: Signer> Session<G> {
             sent_next: [0; 3],
             cursor: [0; 3],
             binding: [0; 32],
+            hello_at_ms: 0,
+            server_time: None,
         }
     }
 
@@ -116,14 +131,17 @@ impl<G: Signer> Session<G> {
         self.state
     }
 
-    /// The transport is up. `binding` is the RFC 9266 tls-exporter value of its TLS session.
-    /// Returns the Hello to send.
+    /// The transport is up. `binding` is the RFC 9266 tls-exporter value of its TLS session,
+    /// and `now_ms` the monotonic time the Hello is sent. Returns the Hello to send.
     pub fn on_connected<S: Storage>(
         &mut self,
         log: &DurableLog<S>,
         binding: [u8; 32],
+        now_ms: u64,
     ) -> Result<Envelope, StorageError> {
         self.binding = binding;
+        self.hello_at_ms = now_ms;
+        self.server_time = None;
         self.phase = Phase::AwaitChallenge;
         self.credit = [0; 3];
         let mut cursors = Vec::with_capacity(3);
@@ -149,6 +167,20 @@ impl<G: Signer> Session<G> {
     pub fn on_disconnected(&mut self) {
         self.phase = Phase::Disconnected;
         self.credit = [0; 3];
+        self.server_time = None;
+    }
+
+    /// The server's time from the Welcome of this authenticated session, as an anchor, once.
+    /// Call right after `on_message`, with the monotonic time the message arrived (plan
+    /// Decision 2); hand the anchor to the recorder.
+    pub fn take_anchor(&mut self, now_ms: u64) -> Option<TimeAnchor> {
+        let utc_ms = self.server_time.take()?;
+        Some(TimeAnchor {
+            mono_ms: now_ms,
+            utc_ms,
+            source: AnchorSource::Server,
+            quality: anchor_quality(now_ms.saturating_sub(self.hello_at_ms)),
+        })
     }
 
     pub fn on_message<S: Storage>(
@@ -241,6 +273,8 @@ impl<G: Signer> Session<G> {
                     self.cursor = [0; 3];
                 }
                 self.state = welcome.state();
+                // Zero is a server with no clock to offer.
+                self.server_time = (welcome.server_time_ms != 0).then_some(welcome.server_time_ms);
                 self.phase = Phase::Active;
                 Ok(Vec::new())
             }
