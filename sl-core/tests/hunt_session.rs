@@ -22,7 +22,7 @@ fn session() -> Session<KeySigner> {
 fn connect_with_state(state: DeviceState) -> Session<KeySigner> {
     let (mut log, _) = DurableLog::open(MemStorage::new(1 << 16)).unwrap();
     let mut s = session();
-    s.on_connected(&log).unwrap();
+    s.on_connected(&log, [0xB1; 32]).unwrap();
     s.on_message(
         Envelope::of(Body::Challenge(Challenge {
             nonce: vec![3; 32],

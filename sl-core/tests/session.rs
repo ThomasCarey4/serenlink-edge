@@ -78,7 +78,7 @@ fn credit(class: Class, bytes: u64) -> Envelope {
 
 /// Run the handshake to `Active` with the given Welcome.
 fn connect(s: &mut Session<KeySigner>, log: &mut DurableLog<MemStorage>, welcome: Envelope) {
-    s.on_connected(log).unwrap();
+    s.on_connected(log, [0xB1; 32]).unwrap();
     s.on_message(
         Envelope::of(Body::Challenge(Challenge {
             nonce: vec![7; 32],
@@ -132,7 +132,7 @@ fn hello_describes_the_device_and_what_it_holds() {
     let mut log = log_with(3, 1);
     log.ack(Class::P0, 1, 1).unwrap();
 
-    let Some(Body::Hello(hello)) = s.on_connected(&log).unwrap().body else {
+    let Some(Body::Hello(hello)) = s.on_connected(&log, [0xB1; 32]).unwrap().body else {
         panic!("expected Hello");
     };
     assert_eq!(hello.device_id, DEVICE);
@@ -149,7 +149,7 @@ fn hello_describes_the_device_and_what_it_holds() {
 fn the_challenge_is_answered_with_a_signature_over_nonce_device_and_host() {
     let mut s = session();
     let mut log = log_with(0, 0);
-    s.on_connected(&log).unwrap();
+    s.on_connected(&log, [0xB1; 32]).unwrap();
     let challenge = Envelope::of(Body::Challenge(Challenge {
         nonce: vec![7; 32],
         ..Challenge::default()
@@ -167,7 +167,7 @@ fn the_challenge_is_answered_with_a_signature_over_nonce_device_and_host() {
     let public_key = KeySigner::from_seed([5; 32]).public_key();
     assert!(verify(
         &public_key,
-        &auth_message(&[7; 32], &DEVICE, HOST),
+        &auth_message(&[7; 32], &DEVICE, HOST, &[0xB1; 32]),
         &auth.signature
     ));
     assert_eq!(s.phase(), Phase::AwaitWelcome);
@@ -573,7 +573,7 @@ fn messages_out_of_place_are_errors() {
         Err(SessionError::Unexpected)
     );
 
-    s.on_connected(&log).unwrap();
+    s.on_connected(&log, [0xB1; 32]).unwrap();
     let no_nonce = Envelope::of(Body::Challenge(Challenge::default()));
     assert_eq!(s.on_message(no_nonce, &mut log), Err(SessionError::BadChallenge));
     let long_nonce = Envelope::of(Body::Challenge(Challenge {
@@ -670,7 +670,7 @@ fn a_welcome_that_contradicts_the_log_is_answered_with_a_resync() {
 
     // Same epoch and a mark at the end of our log, but for content we never sent: the
     // sign of another device with our identity. Skipping to the mark would lose our data.
-    s.on_connected(&log).unwrap();
+    s.on_connected(&log, [0xB1; 32]).unwrap();
     s.on_message(challenge(), &mut log).unwrap();
     let out = s.on_message(welcome_with_chain(3, 0, &[0xaa; 16]), &mut log).unwrap();
     assert_eq!(out, [Envelope::of(Body::Resync(Resync {}))]);
@@ -695,7 +695,7 @@ fn reconnect(
     welcome: Envelope,
 ) -> Result<Vec<Envelope>, SessionError> {
     s.on_disconnected();
-    s.on_connected(log).unwrap();
+    s.on_connected(log, [0xB1; 32]).unwrap();
     s.on_message(challenge(), log).unwrap();
     s.on_message(welcome, log)
 }
@@ -872,10 +872,40 @@ fn a_first_welcome_is_believed_only_with_its_check() {
     // A first Welcome trims nothing, but it names the epoch the device adopts for good.
     let mut s = session();
     let mut log = log_with(2, 0);
-    s.on_connected(&log).unwrap();
+    s.on_connected(&log, [0xB1; 32]).unwrap();
     s.on_message(challenge(), &mut log).unwrap();
     let bad = without_check(welcome(&log, EPOCH, ACTIVE, [0; 3], [0; 3]));
     assert_eq!(s.on_message(bad, &mut log), Err(SessionError::BadCheck));
     assert_eq!(log.epoch(), None);
     assert_eq!(s.phase(), Phase::AwaitWelcome);
+}
+
+#[test]
+fn the_auth_signs_the_channel_binding() {
+    let mut s = session();
+    let mut log = log_with(0, 0);
+    s.on_connected(&log, [0xB1; 32]).unwrap();
+    let out = s
+        .on_message(
+            Envelope::of(Body::Challenge(Challenge {
+                nonce: vec![7; 32],
+                ..Challenge::default()
+            })),
+            &mut log,
+        )
+        .unwrap();
+    let Some(Body::Auth(auth)) = &out[0].body else {
+        panic!("expected an Auth")
+    };
+    let key = KeySigner::from_seed([5; 32]).public_key();
+    assert!(verify(
+        &key,
+        &auth_message(&[7; 32], &DEVICE, HOST, &[0xB1; 32]),
+        &auth.signature
+    ));
+    assert!(!verify(
+        &key,
+        &auth_message(&[7; 32], &DEVICE, HOST, &[0xB2; 32]),
+        &auth.signature
+    ));
 }

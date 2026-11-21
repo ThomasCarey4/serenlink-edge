@@ -407,7 +407,7 @@ fn welcome_state_reads_back_as_an_enum() {
 #[test]
 fn a_signature_verifies_only_for_its_key_and_message() {
     let signer = KeySigner::from_seed([5; 32]);
-    let message = auth_message(&[1; 32], &[2; 16], "ingest.example");
+    let message = auth_message(&[1; 32], &[2; 16], "ingest.example", &[3; 32]);
     let signature = signer.sign(&message);
 
     assert!(verify(&signer.public_key(), &message, &signature));
@@ -418,7 +418,12 @@ fn a_signature_verifies_only_for_its_key_and_message() {
     ));
     assert!(!verify(
         &signer.public_key(),
-        &auth_message(&[9; 32], &[2; 16], "ingest.example"),
+        &auth_message(&[9; 32], &[2; 16], "ingest.example", &[3; 32]),
+        &signature
+    ));
+    assert!(!verify(
+        &signer.public_key(),
+        &auth_message(&[1; 32], &[2; 16], "ingest.example", &[4; 32]),
         &signature
     ));
     assert!(!verify(&signer.public_key(), &message, &signature[..63]));
@@ -426,21 +431,24 @@ fn a_signature_verifies_only_for_its_key_and_message() {
 
 #[test]
 fn auth_message_fields_cannot_run_together() {
-    assert_ne!(auth_message(b"ab", b"c", "d"), auth_message(b"a", b"bc", "d"));
-    assert_ne!(auth_message(b"a", b"b", "cd"), auth_message(b"a", b"bc", "d"));
+    let b = &[0; 32];
+    assert_ne!(auth_message(b"ab", b"c", "d", b), auth_message(b"a", b"bc", "d", b));
+    assert_ne!(auth_message(b"a", b"b", "cd", b), auth_message(b"a", b"bc", "d", b));
 }
 
 /// What a device signs, byte for byte. A server built from another copy of this code must
 /// arrive at the same bytes.
 #[test]
 fn the_auth_message_is_frozen() {
-    let message = auth_message(&[0xaa; 4], &[0xbb; 2], "host");
+    let message = auth_message(&[0xaa; 4], &[0xbb; 2], "host", &[0xcc; 32]);
     let expected: Vec<u8> = [
-        b"serenlink-auth-v1".as_slice(),
+        b"serenlink-auth-v2".as_slice(),
         &[4, 0, 0, 0, 0xaa, 0xaa, 0xaa, 0xaa],
         &[2, 0, 0, 0, 0xbb, 0xbb],
         &[4, 0, 0, 0],
         b"host",
+        &[32, 0, 0, 0],
+        &[0xcc; 32],
     ]
     .concat();
     assert_eq!(message, expected);

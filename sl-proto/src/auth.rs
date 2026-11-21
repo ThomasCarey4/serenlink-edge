@@ -2,18 +2,13 @@ use alloc::vec::Vec;
 
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 
-const CONTEXT: &[u8] = b"serenlink-auth-v1";
+const CONTEXT: &[u8] = b"serenlink-auth-v2";
 
-/// The bytes a device signs to prove its identity for one session. Each field is
-/// length-prefixed so that no two different field sets produce the same message.
-pub fn auth_message(nonce: &[u8], device_id: &[u8], hostname: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(CONTEXT.len() + nonce.len() + device_id.len() + hostname.len() + 12);
-    out.extend_from_slice(CONTEXT);
-    for field in [nonce, device_id, hostname.as_bytes()] {
-        out.extend_from_slice(&(field.len() as u32).to_le_bytes());
-        out.extend_from_slice(field);
-    }
-    out
+/// The bytes a device signs to prove its identity for one session, bound to the TLS channel
+/// it is on (spec 3.2), so an Auth captured on one channel is worthless on any other. Each
+/// field is length-prefixed so that no two different field sets produce the same message.
+pub fn auth_message(nonce: &[u8], device_id: &[u8], hostname: &str, binding: &[u8; 32]) -> Vec<u8> {
+    crate::lp::signed_message(CONTEXT, &[nonce, device_id, hostname.as_bytes(), binding])
 }
 
 /// Holds a device's private key. The shell decides where the key lives.

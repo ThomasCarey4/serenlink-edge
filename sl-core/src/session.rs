@@ -75,6 +75,9 @@ pub struct Session<G: Signer> {
     /// Every batch states it, so the server can tell a sequence jump the device made from a
     /// batch that went missing on the way.
     cursor: [u64; 3],
+    /// The RFC 9266 tls-exporter value of the connection the session is on, which its Auth
+    /// signs.
+    binding: [u8; 32],
 }
 
 impl<G: Signer> Session<G> {
@@ -87,6 +90,7 @@ impl<G: Signer> Session<G> {
             credit: [0; 3],
             sent_next: [0; 3],
             cursor: [0; 3],
+            binding: [0; 32],
         }
     }
 
@@ -100,8 +104,14 @@ impl<G: Signer> Session<G> {
         self.state
     }
 
-    /// The transport is up. Returns the Hello to send.
-    pub fn on_connected<S: Storage>(&mut self, log: &DurableLog<S>) -> Result<Envelope, StorageError> {
+    /// The transport is up. `binding` is the RFC 9266 tls-exporter value of its TLS session.
+    /// Returns the Hello to send.
+    pub fn on_connected<S: Storage>(
+        &mut self,
+        log: &DurableLog<S>,
+        binding: [u8; 32],
+    ) -> Result<Envelope, StorageError> {
+        self.binding = binding;
         self.phase = Phase::AwaitChallenge;
         self.credit = [0; 3];
         let mut cursors = Vec::with_capacity(3);
@@ -149,7 +159,7 @@ impl<G: Signer> Session<G> {
                 if challenge.nonce.len() != 32 {
                     return Err(SessionError::BadChallenge);
                 }
-                let message = auth_message(&challenge.nonce, &self.cfg.device_id, &self.cfg.hostname);
+                let message = auth_message(&challenge.nonce, &self.cfg.device_id, &self.cfg.hostname, &self.binding);
                 let signature = self.signer.sign(&message).to_vec();
                 self.phase = Phase::AwaitWelcome;
                 Ok(vec![Envelope::of(Body::Auth(Auth { signature }))])
