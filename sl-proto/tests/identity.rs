@@ -121,7 +121,7 @@ fn from_bytes_accepts_exactly_the_cap_and_classifies_garbage() {
 }
 
 #[test]
-fn malformed_certificate_bodies_are_bounds_errors() {
+fn out_of_bounds_certificate_bodies_are_bounds_errors() {
     let bad = |c: IdentityCert| {
         let signed = SignedIdentityCert::sign(&c, 1, &RELEASE);
         verify_cert_signature(&signed, &public(&RELEASE))
