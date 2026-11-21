@@ -190,3 +190,35 @@ impl ServerIdentity {
             .to_bytes()
     }
 }
+
+/// The device's check of a Challenge (spec 3.3, steps 2 to 5), against its own binding,
+/// nonce, id and hostname. Nothing is signed by the device unless this is `Ok`.
+pub fn verify_identity(
+    store: &crate::trust::TrustStore,
+    cert: &[u8],
+    sig: &[u8],
+    binding: &[u8; 32],
+    nonce: &[u8; 32],
+    device_id: &[u8],
+    hostname: &str,
+) -> Result<(), IdentityError> {
+    let signed = SignedIdentityCert::from_bytes(cert)?;
+    let release = store
+        .release_key(signed.release_key_id)
+        .ok_or(IdentityError::UnknownReleaseKey)?;
+    let body = verify_cert_signature(&signed, &release)?;
+    if !store.serial_ok(body.serial) {
+        return Err(IdentityError::Revoked);
+    }
+    if !body.hostnames.iter().any(|h| h == hostname) {
+        return Err(IdentityError::WrongHost);
+    }
+    if !verify(
+        &body.pubkey(),
+        &server_message(binding, nonce, device_id, hostname),
+        sig,
+    ) {
+        return Err(IdentityError::BadSignature);
+    }
+    Ok(())
+}

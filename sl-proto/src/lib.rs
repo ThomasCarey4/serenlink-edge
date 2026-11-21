@@ -10,6 +10,7 @@ pub mod identity;
 pub mod ids;
 pub mod lp;
 pub mod record;
+pub mod trust;
 pub mod value;
 pub mod varint;
 pub mod wire;
