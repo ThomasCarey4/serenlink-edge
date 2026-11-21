@@ -1064,3 +1064,36 @@ fn a_welcome_that_fails_its_check_gives_no_anchor() {
     assert_eq!(s.on_message(bad, &mut log), Err(SessionError::BadCheck));
     assert_eq!(s.take_anchor(10_300), None);
 }
+
+/// `msg`, a Welcome, stamped with the server's clock `t` and checked again.
+fn stamped(mut msg: Envelope, t: u64) -> Envelope {
+    if let Some(Body::Welcome(w)) = msg.body.take() {
+        msg.body = Some(Body::Welcome(Welcome { server_time_ms: t, ..w }.with_check()));
+    }
+    msg
+}
+
+#[test]
+fn a_welcome_answered_with_a_resync_gives_no_anchor() {
+    let mut s = session();
+    let mut log = log_with(3, 0);
+    fresh(&mut s, &mut log);
+    s.on_disconnected();
+    s.on_connected(&log, [0xB1; 32], 10_000).unwrap();
+    s.on_message(challenge(), &mut log).unwrap();
+    let diverged = stamped(welcome_with_chain(3, 0, &[0xaa; 16]), 1_767_225_600_000);
+    let out = s.on_message(diverged, &mut log).unwrap();
+    assert_eq!(out, [Envelope::of(Body::Resync(Resync {}))]);
+    assert_eq!(s.take_anchor(10_300), None);
+}
+
+#[test]
+fn a_disconnect_before_the_anchor_is_taken_drops_it() {
+    let mut s = session();
+    let mut log = log_with(0, 0);
+    s.on_connected(&log, [0xB1; 32], 10_000).unwrap();
+    s.on_message(challenge(), &mut log).unwrap();
+    s.on_message(welcome_at(1_767_225_600_000), &mut log).unwrap();
+    s.on_disconnected();
+    assert_eq!(s.take_anchor(10_300), None);
+}
