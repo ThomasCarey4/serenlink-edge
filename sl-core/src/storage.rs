@@ -13,8 +13,8 @@ pub enum StorageError {
 }
 
 /// Small metadata slots `Storage` holds: 0 and 1 are the log's (`Meta`), 2 and 3 the trust
-/// store's (`TrustAnchor`).
-pub const META_SLOTS: usize = 4;
+/// store's (`TrustAnchor`), 4 and 5 the recorder's declared losses (`Summary`).
+pub const META_SLOTS: usize = 6;
 
 /// Three append-only byte logs, one per class, plus `META_SLOTS` small metadata slots.
 ///

@@ -7,6 +7,7 @@ use sl_core::log::{DECLARATION_RESERVE, DurableLog, LostRange};
 use sl_core::mem_storage::MemStorage;
 use sl_core::recorder::{Recorder, RecorderConfig, Sealed};
 use sl_core::storage::{Storage, StorageError};
+use sl_core::summary::Summary;
 use sl_proto::block::Block;
 use sl_proto::ids::Class;
 use sl_proto::record::{Define, GapReason, Kind};
@@ -346,10 +347,11 @@ fn a_header_that_rots_at_run_time_is_found_by_the_upload_scan() {
     );
 }
 
-/// `MemStorage` whose metadata writes, or P0 appends, can be made to fail.
+/// `MemStorage` whose log metadata writes, summary writes, or P0 appends, can be made to fail.
 struct Faulty<'a> {
     inner: MemStorage,
     fail_meta: &'a Cell<bool>,
+    fail_summary: &'a Cell<bool>,
     fail_p0: &'a Cell<bool>,
 }
 
@@ -382,7 +384,8 @@ impl Storage for Faulty<'_> {
         self.inner.read_meta(slot)
     }
     fn write_meta(&mut self, slot: usize, data: &[u8]) -> Result<(), StorageError> {
-        if self.fail_meta.get() {
+        // The log's own metadata (`Meta`, slots 0 and 1), not the recorder's summary.
+        if self.fail_meta.get() && slot < 2 || self.fail_summary.get() && slot >= 4 {
             return Err(StorageError::Io);
         }
         self.inner.write_meta(slot, data)
@@ -467,6 +470,147 @@ fn evicting_a_rotted_p0_declaration_declares_this_boots_losses_again() {
     assert!(is_declared(&log, Class::P2, 0), "its only declaration was evicted");
 }
 
+/// A recorder as a later boot starts it.
+fn eager_boot(boot_id: u32) -> Recorder {
+    Recorder::new(
+        RecorderConfig {
+            seal_ms: [0; 3],
+            ..RecorderConfig::default()
+        },
+        boot_id,
+    )
+}
+
+/// Residual 2 of declare-before-destroy: a declaration written in one boot, which rots in a
+/// later one (`rot_after_restart`) or rots and is found only after a restart (otherwise).
+fn a_declaration_rotted_across_a_restart_is_declared_again(rot_after_restart: bool) {
+    let mut log = open(3_000 + DECLARATION_RESERVE);
+    let mut rec = eager();
+    // A P2 block too large ever to fit: dropped, and declared in P0 frame 0.
+    put(&mut rec, &mut log, Class::P2, 1, 4_000);
+    assert!(is_declared(&log, Class::P2, 0));
+    let rot = |log: &mut DurableLog<MemStorage>| log.storage_mut().corrupt(Class::P0, HEADER_LEN as u64 + 5);
+    if !rot_after_restart {
+        rot(&mut log);
+    }
+    let (mut log, recovery) = reopen(log);
+    let mut rec = eager_boot(2);
+    let mut sealed = Vec::new();
+    rec.report_recovery(&recovery, 1, &mut log, &mut sealed).unwrap();
+    if rot_after_restart {
+        rot(&mut log);
+    }
+    // P0 fills up offline until frame 0 is evicted, or the upload scan finds it rotted.
+    upload(&mut log);
+    for t in 2..42 {
+        put(&mut rec, &mut log, Class::P0, t, 200);
+    }
+    assert!(log.first_retained_seq(Class::P0).unwrap() > 0, "frame 0 was evicted");
+    assert!(
+        is_declared(&log, Class::P2, 0),
+        "its only declaration rotted after the boot that wrote it"
+    );
+}
+
+#[test]
+fn a_declaration_that_rots_after_a_restart_is_declared_again() {
+    a_declaration_rotted_across_a_restart_is_declared_again(true);
+}
+
+#[test]
+fn a_declaration_that_rots_before_a_restart_and_is_found_after_it_is_declared_again() {
+    a_declaration_rotted_across_a_restart_is_declared_again(false);
+}
+
+#[test]
+fn the_summary_lets_go_of_declarations_the_server_has_backed_up() {
+    let mut log = open(100_000);
+    let mut rec = eager();
+    // Two P2 blocks dropped while offline, each declared in a P0 frame of its own.
+    let mut sealed = Vec::new();
+    for t in 1..=2 {
+        rec.sample(Class::P2, &def(3), t, Value::Blob(vec![1; 200_000]));
+        rec.tick(t, &mut log, &mut sealed).unwrap();
+    }
+    let summary = Summary::load(log.storage());
+    assert_eq!(summary.carrier_end, 2);
+    assert!(
+        summary.gaps.iter().any(|g| g.lost_class == Class::P2 as u8),
+        "{summary:?}"
+    );
+    // The server backs up both declarations; the next one need not repeat them.
+    upload(&mut log);
+    log.ack(Class::P0, 2, 2).unwrap();
+    rec.sample(Class::P1, &def(2), 3, Value::Blob(vec![1; 200_000]));
+    rec.tick(3, &mut log, &mut sealed).unwrap();
+    let summary = Summary::load(log.storage());
+    assert_eq!(summary.carrier_end, 3);
+    assert!(!summary.gaps.is_empty());
+    assert!(
+        summary.gaps.iter().all(|g| g.lost_class == Class::P1 as u8),
+        "{summary:?}"
+    );
+}
+
+#[test]
+fn the_summary_keeps_declarations_until_the_backup_mark_reaches_the_newest() {
+    let mut log = open(100_000);
+    let mut rec = eager();
+    let mut sealed = Vec::new();
+    for t in 1..=2 {
+        rec.sample(Class::P2, &def(3), t, Value::Blob(vec![1; 200_000]));
+        rec.tick(t, &mut log, &mut sealed).unwrap();
+    }
+    // The server has backed up the first declaration but not the second.
+    upload(&mut log);
+    log.ack(Class::P0, 1, 1).unwrap();
+    rec.sample(Class::P1, &def(2), 3, Value::Blob(vec![1; 200_000]));
+    rec.tick(3, &mut log, &mut sealed).unwrap();
+    let summary = Summary::load(log.storage());
+    assert_eq!(summary.carrier_end, 3);
+    assert!(
+        summary.gaps.iter().any(|g| g.lost_class == Class::P2 as u8),
+        "{summary:?}"
+    );
+    assert!(
+        summary.gaps.iter().any(|g| g.lost_class == Class::P1 as u8),
+        "{summary:?}"
+    );
+}
+
+#[test]
+fn a_declaration_whose_summary_cannot_be_written_is_owed_and_evicts_nothing() {
+    let fail_summary = Cell::new(false);
+    let no = Cell::new(false);
+    let storage = Faulty {
+        inner: MemStorage::new(3_000 + DECLARATION_RESERVE),
+        fail_meta: &no,
+        fail_summary: &fail_summary,
+        fail_p0: &no,
+    };
+    let (mut log, _) = DurableLog::open(storage).unwrap();
+    let mut rec = eager();
+    for t in 1..=10 {
+        put(&mut rec, &mut log, Class::P2, t, 200);
+    }
+    let used = log.used();
+    let front = log.first_retained_seq(Class::P2).unwrap();
+    // Filling the store needs an eviction, whose summary cannot be written.
+    fail_summary.set(true);
+    rec.sample(Class::P1, &def(2), 11, Value::Blob(vec![1; 2_000]));
+    let mut sealed = Vec::new();
+    assert_eq!(rec.tick(11, &mut log, &mut sealed), Err(StorageError::Io));
+    assert!(sealed.is_empty());
+    assert_eq!(log.used(), used, "nothing appended");
+    assert_eq!(log.first_retained_seq(Class::P2).unwrap(), front, "nothing evicted");
+    // Once it can be written, the eviction goes ahead, declared.
+    fail_summary.set(false);
+    rec.sample(Class::P1, &def(2), 12, Value::Blob(vec![1; 2_000]));
+    rec.tick(12, &mut log, &mut sealed).unwrap();
+    assert!(log.first_retained_seq(Class::P2).unwrap() > front);
+    assert!(is_declared(&log, Class::P2, front));
+}
+
 #[test]
 fn a_dropped_block_is_reported_declared_even_when_its_skip_fails() {
     let fail_meta = Cell::new(false);
@@ -474,6 +618,7 @@ fn a_dropped_block_is_reported_declared_even_when_its_skip_fails() {
     let storage = Faulty {
         inner: MemStorage::new(3_000 + DECLARATION_RESERVE),
         fail_meta: &fail_meta,
+        fail_summary: &Cell::new(false),
         fail_p0: &fail_p0,
     };
     let (mut log, _) = DurableLog::open(storage).unwrap();
@@ -494,6 +639,7 @@ fn a_block_lost_while_making_room_is_accounted_for_like_any_dropped_block() {
     let storage = Faulty {
         inner: MemStorage::new(1_000 + DECLARATION_RESERVE),
         fail_meta: &fail_meta,
+        fail_summary: &Cell::new(false),
         fail_p0: &fail_p0,
     };
     let (mut log, _) = DurableLog::open(storage).unwrap();

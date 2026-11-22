@@ -12,6 +12,7 @@ use sl_proto::value::Value;
 use crate::frame::HEADER_LEN;
 use crate::log::{DECLARATION_RESERVE, DurableLog, FrameRef, LostRange, Recovery};
 use crate::storage::{Storage, StorageError};
+use crate::summary::Summary;
 
 /// Most gaps a declaration block holds before each class collapses to one.
 pub const MAX_DECLARED_GAPS: usize = 8;
@@ -71,9 +72,12 @@ pub struct Recorder {
     /// Gaps whose declaration could not be written, as when a flash write failed. They go
     /// out with the next declaration.
     owed: Vec<Gap>,
-    /// Every loss declared since this boot, merged and bounded like a declaration. When a P0
-    /// frame rots, the gaps it carried cannot be read, so these are declared again.
-    declared: Vec<Gap>,
+    /// Every loss declared and not yet known to be backed up, merged and bounded like a
+    /// declaration, and kept in the metadata so that it outlives a restart. When a P0 frame
+    /// rots, the gaps it carried cannot be read, so these are declared again.
+    summary: Summary,
+    /// Whether `summary` has been read back from the metadata since this boot.
+    recalled: bool,
 }
 
 impl Recorder {
@@ -85,7 +89,8 @@ impl Recorder {
             approx_bytes: [0; 3],
             defined: [BTreeMap::new(), BTreeMap::new(), BTreeMap::new()],
             owed: Vec::new(),
-            declared: Vec::new(),
+            summary: Summary::default(),
+            recalled: false,
             boot_id,
             cfg,
         }
@@ -133,7 +138,16 @@ impl Recorder {
         log: &mut DurableLog<S>,
         sealed: &mut Vec<Sealed>,
     ) -> Result<(), StorageError> {
+        self.recall(log);
         self.declare_corrupt(&recovery.corrupt, now_ms, log, sealed)
+    }
+
+    /// Read back what earlier boots declared, once, before anything here can need it.
+    fn recall<S: Storage>(&mut self, log: &DurableLog<S>) {
+        if !self.recalled {
+            self.summary = Summary::load(log.storage());
+            self.recalled = true;
+        }
     }
 
     /// Seal every block that has been open for its interval or has grown large.
@@ -143,6 +157,7 @@ impl Recorder {
         log: &mut DurableLog<S>,
         sealed: &mut Vec<Sealed>,
     ) -> Result<(), StorageError> {
+        self.recall(log);
         self.declare_undeclared(now_ms, log, sealed)?;
         for class in Class::ALL {
             let i = class.index();
@@ -163,6 +178,7 @@ impl Recorder {
         log: &mut DurableLog<S>,
         sealed: &mut Vec<Sealed>,
     ) -> Result<(), StorageError> {
+        self.recall(log);
         self.declare_undeclared(now_ms, log, sealed)?;
         for class in Class::ALL {
             self.seal(class, now_ms, log, sealed)?;
@@ -201,14 +217,14 @@ impl Recorder {
     }
 
     /// The gaps that declare `lost` as corrupt. A rotted P0 frame may have been a declaration,
-    /// so with one among them, what this boot has declared is declared again.
+    /// so with one among them, everything the summary holds is declared again.
     fn corrupt_gaps(&self, lost: &[LostRange], now_ms: u64) -> Vec<Gap> {
         let mut gaps: Vec<Gap> = lost
             .iter()
             .map(|lost| self.loss(GapReason::Corrupt, lost.class, now_ms, lost.first_seq, lost.count))
             .collect();
         if lost.iter().any(|lost| lost.class == Class::P0) {
-            gaps.extend(self.declared.iter().copied());
+            gaps.extend(self.summary.gaps.iter().copied());
         }
         gaps
     }
@@ -429,9 +445,9 @@ impl Recorder {
                 }
             }
             // An unreadable P0 frame may have been a declaration: what it carried is lost with
-            // it, so declare again what this boot has.
+            // it, so declare again what the summary holds.
             if unreadable {
-                gaps.extend(self.declared.iter().copied());
+                gaps.extend(self.summary.gaps.iter().copied());
             }
         }
         Ok(gaps)
@@ -498,12 +514,25 @@ impl Recorder {
         log: &mut DurableLog<S>,
     ) -> Result<Sealed, StorageError> {
         let hash = block_hash(encoded);
-        let first_seq = log.append_declaration(Compression::None as u8, hash, count, encoded)?;
-        if let Ok(block) = Block::decode(encoded) {
-            let mut declared = core::mem::take(&mut self.declared);
-            declared.extend(block.gaps);
-            self.declared = merge_gaps(declared);
+        // The summary goes first: a declaration it does not cover could rot unrecoverably.
+        // If the append then fails, the summary names losses no declaration does, which only
+        // over-reports.
+        let mut summary = self.summary.clone();
+        if log.backed_up_next(Class::P0) >= summary.carrier_end {
+            // Every declaration it covered is backed up: the server has their gaps.
+            summary.gaps.clear();
         }
+        if let Ok(block) = Block::decode(encoded) {
+            summary.gaps.extend(block.gaps);
+            summary.gaps = merge_gaps(core::mem::take(&mut summary.gaps));
+        }
+        summary.carrier_end = log.next_seq(Class::P0) + u64::from(count);
+        // A retry of a declaration whose append failed covers nothing new: no second write.
+        if summary != self.summary {
+            summary.store(log.storage_mut())?;
+            self.summary = summary;
+        }
+        let first_seq = log.append_declaration(Compression::None as u8, hash, count, encoded)?;
         Ok(Sealed {
             class: Class::P0,
             first_seq,

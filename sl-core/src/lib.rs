@@ -9,4 +9,5 @@ pub mod meta;
 pub mod recorder;
 pub mod session;
 pub mod storage;
+pub mod summary;
 pub mod trust;
