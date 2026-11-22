@@ -1067,9 +1067,10 @@ fn a_welcome_that_fails_its_check_gives_no_anchor() {
 
 /// `msg`, a Welcome, stamped with the server's clock `t` and checked again.
 fn stamped(mut msg: Envelope, t: u64) -> Envelope {
-    if let Some(Body::Welcome(w)) = msg.body.take() {
-        msg.body = Some(Body::Welcome(Welcome { server_time_ms: t, ..w }.with_check()));
-    }
+    let Some(Body::Welcome(w)) = msg.body else {
+        panic!("not a Welcome")
+    };
+    msg.body = Some(Body::Welcome(Welcome { server_time_ms: t, ..w }.with_check()));
     msg
 }
 

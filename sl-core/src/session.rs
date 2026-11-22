@@ -26,7 +26,9 @@ pub enum SessionError {
     Unexpected,
     /// The Challenge did not carry a 32-byte nonce.
     BadChallenge,
-    /// The Challenge's server identity did not verify (spec 3.3): nothing was signed.
+    /// The Challenge's server identity did not verify (spec 3.3): nothing was signed. The
+    /// session stays in `AwaitChallenge`; the shell must close the transport, since the peer on
+    /// this channel is not the server.
     BadIdentity,
     /// The Welcome was malformed, or named a protocol version that was not offered.
     BadWelcome,

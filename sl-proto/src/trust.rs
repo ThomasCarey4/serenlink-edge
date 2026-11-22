@@ -94,8 +94,7 @@ impl TrustStore {
 
     /// `next`, if this store's keys signed it and it is newer (spec 5.2).
     pub fn accept_successor(&self, next: &SignedTrustStore) -> Result<TrustStore, TrustError> {
-        // Authenticate first: nothing is decoded beyond the size cap until a current key
-        // has signed it.
+        // Authenticate first: the body is not decoded until a current key has signed it.
         let key = self
             .release_key(next.release_key_id)
             .ok_or(TrustError::UnknownReleaseKey)?;
