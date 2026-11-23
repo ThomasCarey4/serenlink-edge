@@ -576,7 +576,58 @@ fn a_deferred_apply_survives_a_disconnect() {
     r.sink.apply_now(&t);
     r.control.finish(Tables, 2, Outcome::Applied, Reason::None);
     r.control.on_disconnected();
-    assert_eq!(reports(&r.poll()), vec![rep(Tables, 2, Outcome::Applied, Reason::None)]);
+    r.offer(vec![t]);
+    let out = r.poll();
+    assert!(fetches(&out).is_empty());
+    assert_eq!(reports(&out), vec![rep(Tables, 2, Outcome::Applied, Reason::None)]);
+}
+
+#[test]
+fn a_deferred_kind_is_not_fetched_again_until_finished() {
+    let mut r = Rig::new();
+    r.sink.set_defer(true);
+    let v2 = r.release(Tables, 2, body(100, 1));
+    r.offer(vec![v2.clone()]);
+    r.pump();
+    let v3 = r.release(Tables, 3, body(100, 2));
+    r.offer(vec![v3.clone()]);
+    assert!(fetches(&r.poll()).is_empty());
+
+    r.sink.set_defer(false);
+    r.sink.apply_now(&v2);
+    r.control.finish(Tables, 2, Outcome::Applied, Reason::None);
+    let out = r.pump();
+    assert_eq!(fetches(&out)[0].version, 3);
+    assert_eq!(r.control.running(Tables, r.anchor.active()), 3);
+    // A late finish of an older version never lowers it.
+    r.control.finish(Tables, 2, Outcome::Applied, Reason::None);
+    assert_eq!(r.control.running(Tables, r.anchor.active()), 3);
+}
+
+#[test]
+fn a_deferred_failure_is_not_retried_this_session() {
+    let mut r = Rig::new();
+    r.sink.set_defer(true);
+    let t = r.release(Tables, 2, body(100, 1));
+    r.offer(vec![t.clone()]);
+    r.pump();
+    r.control.finish(Tables, 2, Outcome::Failed, Reason::Apply);
+    r.offer(vec![t]);
+    let out = r.poll();
+    assert!(fetches(&out).is_empty());
+    assert_eq!(reports(&out), vec![rep(Tables, 2, Outcome::Failed, Reason::Apply)]);
+}
+
+#[test]
+fn report_applied_covers_what_finish_cannot() {
+    let mut r = Rig::new();
+    r.control.report_applied(Firmware, 5);
+    assert_eq!(r.control.running(Firmware, r.anchor.active()), 5);
+    let out = r.poll();
+    assert_eq!(reports(&out), vec![rep(Firmware, 5, Outcome::Applied, Reason::None)]);
+    let f = r.release(Firmware, 5, body(100, 4));
+    r.offer(vec![f]);
+    assert!(r.poll().is_empty());
 }
 
 #[test]

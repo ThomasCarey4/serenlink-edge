@@ -198,6 +198,11 @@ impl Control {
             let Some(m) = self.offered[kind.index()].clone() else {
                 continue;
             };
+            // A deferred apply owns the sink's slot for its kind until `finish`: beginning
+            // another download would discard its body.
+            if self.deferred.iter().any(|d| d.kind() == Some(kind)) {
+                continue;
+            }
             if self.gone.contains(&(kind, m.version)) || self.failed.contains(&(kind, m.version)) {
                 continue;
             }
@@ -296,7 +301,8 @@ impl Control {
 
     /// The shell's word on a deferred apply of (`kind`, `version`): `Applied` once it is
     /// running, or `Failed`. Anything that is not a deferred apply is ignored. The report waits
-    /// for the next `poll`, which may be in a later session.
+    /// for the next `poll`, which may be in a later session. No `Event` comes back: after an
+    /// `Applied` the shell must also call `Session::set_running`.
     pub fn finish(&mut self, kind: ArtifactKind, version: u32, outcome: Outcome, reason: Reason) {
         let Some(at) = self
             .deferred
@@ -306,10 +312,31 @@ impl Control {
             return;
         };
         self.deferred.remove(at);
-        if outcome == Outcome::Applied && kind != ArtifactKind::Trust {
-            self.running[kind.index()] = version;
+        match outcome {
+            Outcome::Applied => self.raise(kind, version),
+            _ => {
+                self.failed.insert((kind, version));
+            }
         }
         self.reports.push(report(kind as u32, version, outcome, reason));
+    }
+
+    /// An artifact the shell applied outside a live deferral, such as firmware that passed its
+    /// probation after a reboot (`deferred` is RAM only, so `finish` cannot know it). Raises
+    /// what runs and queues the `Applied` report for the next `poll`. The shell must also call
+    /// `Session::set_running`.
+    pub fn report_applied(&mut self, kind: ArtifactKind, version: u32) {
+        self.raise(kind, version);
+        self.reports
+            .push(report(kind as u32, version, Outcome::Applied, Reason::None));
+    }
+
+    /// What runs never goes down.
+    fn raise(&mut self, kind: ArtifactKind, version: u32) {
+        if kind != ArtifactKind::Trust {
+            let r = &mut self.running[kind.index()];
+            *r = (*r).max(version);
+        }
     }
 
     /// A verified body: make it active (spec 2.3).
@@ -326,7 +353,7 @@ impl Control {
         }
         match sink.apply(m) {
             ApplyResult::Applied => {
-                self.running[kind.index()] = m.version;
+                self.raise(kind, m.version);
                 self.reports
                     .push(report(kind as u32, m.version, Outcome::Applied, Reason::None));
                 Event::Applied(kind, m.version)
@@ -350,6 +377,8 @@ impl Control {
         storage: &mut S,
     ) -> Event {
         let v = m.version;
+        // Refusals go straight to `reports`, not through `refused`: the `failed` set below is
+        // what stops the same store being fetched again.
         let refuse = |c: &mut Self, reason| {
             // Not fetched again this session: the same bytes would be refused again.
             c.failed.insert((ArtifactKind::Trust, v));
@@ -358,6 +387,7 @@ impl Control {
             Event::None
         };
         let size = m.size as usize;
+        // A backstop: `verify_manifest` already caps a Trust manifest's size.
         if size > MAX_TRUST_STORE_BYTES {
             return refuse(self, Reason::TooBig);
         }
