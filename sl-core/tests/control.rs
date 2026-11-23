@@ -283,6 +283,13 @@ fn a_misplaced_or_overlong_chunk_is_dropped_and_fetched_again() {
     r.chunk(c);
     assert_eq!(fetches(&r.poll()), vec![f.clone()]);
 
+    // More than one chunk's worth, though within the size.
+    let mut c = r.answer(&f);
+    c.bytes = vec![0; MAX_CHUNK + 1];
+    r.chunk(c);
+    assert_eq!(fetches(&r.poll()), vec![f.clone()]);
+    assert_eq!(r.sink.progress(Tables), Some((2, 0)));
+
     // Bytes past the size.
     let mut c = r.answer(&f);
     c.offset = 0;
@@ -372,4 +379,95 @@ fn a_withdrawn_offer_stops_the_download() {
     assert!(r.poll().is_empty());
     assert_eq!(r.sink.progress(Tables), Some((2, 16384)));
     assert!(r.sink.applied().is_empty());
+}
+
+#[test]
+fn a_replacement_offer_waits_for_the_chunk_in_flight() {
+    let mut r = Rig::new();
+    let v2 = r.release(Tables, 2, body(40 * 1024, 9));
+    let v3 = r.release(Tables, 3, body(40 * 1024, 10));
+    r.offer(vec![v2]);
+    let f = fetches(&r.poll()).remove(0);
+    r.offer(vec![v3.clone()]);
+    // v2's Fetch is still unanswered: the server allows only one outstanding.
+    assert!(r.poll().is_empty());
+    let c = r.answer(&f);
+    r.chunk(c);
+    assert_eq!(r.sink.progress(Tables), Some((2, 0)));
+    let out = r.pump();
+    let first = &fetches(&out)[0];
+    assert_eq!((first.version, first.offset), (3, 0));
+    assert_eq!(reports(&out), vec![rep(Tables, 3, Outcome::Applied, Reason::None)]);
+    assert_eq!(r.sink.running(Tables).map(|(m, _)| m), Some(&v3));
+}
+
+#[test]
+fn a_withdrawn_and_reoffered_download_keeps_one_fetch_outstanding() {
+    let mut r = Rig::new();
+    let t = r.release(Tables, 2, body(40 * 1024, 9));
+    r.offer(vec![t.clone()]);
+    let f = fetches(&r.poll()).remove(0);
+    let c = r.answer(&f);
+    r.chunk(c);
+    let f = fetches(&r.poll()).remove(0);
+    assert_eq!(f.offset, 16384);
+    r.offer(vec![]);
+    r.offer(vec![t]);
+    assert!(r.poll().is_empty());
+
+    // The answer to the withdrawn download's Fetch is not used, but frees the lane.
+    let c = r.answer(&f);
+    r.chunk(c);
+    assert_eq!(r.sink.progress(Tables), Some((2, 16384)));
+    let mut outstanding: Option<Fetch> = None;
+    let mut seen = Vec::new();
+    for _ in 0..100 {
+        let out = r.poll();
+        let fs = fetches(&out);
+        assert!(fs.len() <= 1);
+        if let Some(f) = fs.into_iter().next() {
+            assert!(outstanding.is_none(), "a second Fetch while one is outstanding");
+            outstanding = Some(f);
+        }
+        seen.extend(out);
+        let Some(f) = outstanding.take() else { break };
+        // Polling again before answering sends nothing.
+        assert!(fetches(&r.poll()).is_empty());
+        let c = r.answer(&f);
+        r.chunk(c);
+    }
+    let offsets: Vec<u64> = fetches(&seen).iter().map(|f| f.offset).collect();
+    assert_eq!(offsets, vec![16384, 32768]);
+    assert_eq!(reports(&seen), vec![rep(Tables, 2, Outcome::Applied, Reason::None)]);
+}
+
+#[test]
+fn queued_reports_survive_a_disconnect() {
+    let mut r = Rig::new();
+    r.control = Control::new(DEVICE, [1, 5, 1, 0]);
+    let m = r.release(Tables, 4, body(100, 0));
+    r.offer(vec![m]);
+    r.control.on_disconnected();
+    assert_eq!(
+        reports(&r.poll()),
+        vec![rep(Tables, 4, Outcome::Refused, Reason::NotNewer)]
+    );
+}
+
+#[test]
+fn a_refusal_is_reported_again_in_the_next_session() {
+    let mut r = Rig::new();
+    r.control = Control::new(DEVICE, [1, 5, 1, 0]);
+    let m = r.release(Tables, 4, body(100, 0));
+    r.offer(vec![m.clone()]);
+    assert_eq!(
+        reports(&r.poll()),
+        vec![rep(Tables, 4, Outcome::Refused, Reason::NotNewer)]
+    );
+    r.control.on_disconnected();
+    r.offer(vec![m]);
+    assert_eq!(
+        reports(&r.poll()),
+        vec![rep(Tables, 4, Outcome::Refused, Reason::NotNewer)]
+    );
 }

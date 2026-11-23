@@ -8,7 +8,7 @@ use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 use sha2::{Digest, Sha256};
-use sl_proto::artifact::{ArtifactKind, Manifest, Outcome, Reason, verify_manifest};
+use sl_proto::artifact::{ArtifactKind, MAX_CHUNK, Manifest, Outcome, Reason, verify_manifest};
 use sl_proto::trust::TrustStore;
 use sl_proto::wire::{Body, Chunk, Envelope, Fetch, Offer, Report};
 
@@ -43,7 +43,10 @@ pub struct Control {
     /// The current offer, by kind, with every manifest already verified.
     offered: [Option<Manifest>; 4],
     current: Option<Download>,
-    in_flight: bool,
+    /// The (kind, version) of the `Fetch` not yet answered. It outlives a withdrawn download:
+    /// the server allows one `Fetch` outstanding, so nothing is fetched until its `Chunk`
+    /// arrives, even when that `Chunk` is no longer wanted.
+    in_flight: Option<(u32, u32)>,
     /// (kind, version) already reported refused this session, so each is reported once.
     refused: BTreeSet<(u32, u32)>,
     /// Failed this session: not fetched again until the next one.
@@ -71,7 +74,7 @@ impl Control {
             running,
             offered: Default::default(),
             current: None,
-            in_flight: false,
+            in_flight: None,
             refused: BTreeSet::new(),
             failed: BTreeSet::new(),
             gone: BTreeSet::new(),
@@ -91,7 +94,7 @@ impl Control {
     pub fn on_disconnected(&mut self) {
         self.offered = Default::default();
         self.current = None;
-        self.in_flight = false;
+        self.in_flight = None;
         self.refused.clear();
         self.failed.clear();
         self.gone.clear();
@@ -127,9 +130,12 @@ impl Control {
         }
         self.offered = offered;
         if let Some(d) = &self.current
+            // The whole manifest, not just (kind, version): one re-signed at the same version
+            // restarts the download, as the sink's partial may be of different bytes.
             && self.offered[d.kind.index()].as_ref() != Some(&d.m)
         {
-            // Withdrawn: a Chunk still on its way for it is ignored, being no longer current.
+            // Withdrawn: its Fetch stays in flight, and the Chunk answering it is ignored,
+            // being no longer current.
             self.drop_download();
         }
     }
@@ -146,17 +152,16 @@ impl Control {
     }
 
     /// End the current download; the `failed` and `gone` sets, or the offer, say whether it
-    /// starts again.
+    /// starts again. A `Fetch` in flight stays so until answered.
     fn drop_download(&mut self) {
         self.current = None;
-        self.in_flight = false;
     }
 
     /// Queued reports, then at most one `Fetch` (spec 2.2): nothing is fetched while one is
     /// unanswered, and the next download is the first offered kind in `FETCH_ORDER`.
     pub fn poll<K: ArtifactSink>(&mut self, sink: &mut K) -> Vec<Envelope> {
         let mut out: Vec<Envelope> = self.reports.drain(..).map(|r| Envelope::of(Body::Report(r))).collect();
-        if self.in_flight {
+        if self.in_flight.is_some() {
             return out;
         }
         if self.current.is_none() {
@@ -170,7 +175,7 @@ impl Control {
                 version: d.m.version,
                 offset: d.next,
             })));
-            self.in_flight = true;
+            self.in_flight = Some((d.kind as u32, d.m.version));
         }
         out
     }
@@ -206,9 +211,11 @@ impl Control {
         }
     }
 
-    /// The answer to the `Fetch` in flight (spec 2.2, 2.3). A chunk at the wrong offset or
-    /// past the size is dropped and the next `poll` asks again; the body is believed only once
-    /// all of it has been read back from the sink and its hash matches the manifest.
+    /// The answer to the `Fetch` in flight (spec 2.2, 2.3). Any chunk of the (kind, version)
+    /// in flight answers it; only one of the current download is used. A chunk at the wrong
+    /// offset, longer than `MAX_CHUNK` or past the size is dropped and the next `poll` asks
+    /// again; the body is believed only once all of it has been read back from the sink and its
+    /// hash matches the manifest.
     pub fn on_chunk<K: ArtifactSink, S: Storage>(
         &mut self,
         chunk: Chunk,
@@ -216,13 +223,15 @@ impl Control {
         anchor: &mut TrustAnchor,
         storage: &mut S,
     ) -> Event {
+        if self.in_flight != Some((chunk.kind, chunk.version)) {
+            return Event::None;
+        }
+        self.in_flight = None;
+        // In flight implies current or withdrawn: `poll` starts a download only with nothing
+        // in flight, so a current download is always the one fetched.
         let Some(d) = &mut self.current else {
             return Event::None;
         };
-        if !self.in_flight || chunk.kind != d.kind as u32 || chunk.version != d.m.version {
-            return Event::None;
-        }
-        self.in_flight = false;
         let (kind, version) = (d.kind, d.m.version);
         if chunk.bytes.is_empty() {
             self.gone.insert((kind, version));
@@ -230,7 +239,10 @@ impl Control {
             return Event::None;
         }
         let len = chunk.bytes.len() as u64;
-        if chunk.offset != d.next || chunk.offset.checked_add(len).is_none_or(|end| end > d.m.size) {
+        if chunk.offset != d.next
+            || chunk.bytes.len() > MAX_CHUNK
+            || chunk.offset.checked_add(len).is_none_or(|end| end > d.m.size)
+        {
             return Event::None;
         }
         if sink.write(kind, chunk.offset, &chunk.bytes).is_err() {
