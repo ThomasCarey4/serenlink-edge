@@ -291,8 +291,10 @@ impl<G: Signer> Session<G> {
                 self.phase = Phase::Active;
                 Ok(Vec::new())
             }
-            // Sent by the server alongside a Welcome that was answered with a Resync.
-            (Phase::AwaitWelcome, Body::Credit(_) | Body::Ack(_)) => Ok(Vec::new()),
+            // Sent by the server alongside a Welcome that was answered with a Resync: its
+            // Credits, Acks and Offer. The Offer that follows the next Welcome replaces it.
+            // A Chunk answers a Fetch, which no session sends before it is active.
+            (Phase::AwaitWelcome, Body::Credit(_) | Body::Ack(_) | Body::Offer(_)) => Ok(Vec::new()),
             // In an active session a message about a class this build does not know is
             // ignored, for the same reason as an unknown message kind.
             (Phase::Active, Body::Ack(ack)) => {

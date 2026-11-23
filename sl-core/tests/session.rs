@@ -682,6 +682,9 @@ fn a_welcome_that_contradicts_the_log_is_answered_with_a_resync() {
     assert_eq!(out, [Envelope::of(Body::Resync(Resync {}))]);
     assert_eq!(s.phase(), Phase::AwaitWelcome);
     assert!(s.on_message(credit(Class::P0, 1_000), &mut log).unwrap().is_empty());
+    // The server's Offer follows the Welcome it answered with the Resync.
+    let offer = Envelope::of(Body::Offer(Offer { manifests: vec![] }));
+    assert_eq!(s.on_message(offer, &mut log), Ok(vec![]));
 
     let fresh_epoch = welcome(&log, [0xe9; 16], ACTIVE, [0; 3], [0; 3]);
     assert!(s.on_message(fresh_epoch, &mut log).unwrap().is_empty());
@@ -1135,6 +1138,10 @@ fn the_session_lets_control_messages_pass() {
     };
     assert_eq!(s.on_message(offer(), &mut log), Err(SessionError::Unexpected));
     s.on_connected(&log, [0xB1; 32], 0).unwrap();
+    assert_eq!(s.on_message(chunk(), &mut log), Err(SessionError::Unexpected));
+    s.on_message(challenge(), &mut log).unwrap();
+    assert_eq!(s.phase(), Phase::AwaitWelcome);
+    assert_eq!(s.on_message(offer(), &mut log), Ok(vec![]));
     assert_eq!(s.on_message(chunk(), &mut log), Err(SessionError::Unexpected));
     fresh(&mut s, &mut log);
     assert_eq!(s.on_message(offer(), &mut log), Ok(vec![]));
