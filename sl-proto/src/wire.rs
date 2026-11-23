@@ -1,13 +1,14 @@
 //! Protobuf messages. Field tags are the contract: never reuse or renumber one.
 use alloc::vec::Vec;
 
+use crate::artifact::Manifest;
 use sha2::{Digest, Sha256};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Envelope {
-    #[prost(oneof = "Body", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
+    #[prost(oneof = "Body", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13")]
     pub body: Option<Body>,
 }
 
@@ -37,6 +38,60 @@ pub enum Body {
     Credit(Credit),
     #[prost(message, tag = "9")]
     Resync(Resync),
+    #[prost(message, tag = "10")]
+    Offer(Offer),
+    #[prost(message, tag = "11")]
+    Fetch(Fetch),
+    #[prost(message, tag = "12")]
+    Chunk(Chunk),
+    #[prost(message, tag = "13")]
+    Report(Report),
+}
+
+/// Server → device: the artifacts the device should have, each newer than what its Hello
+/// said it runs. A later `Offer` replaces this one; an empty one means stop.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct Offer {
+    #[prost(message, repeated, tag = "1")]
+    pub manifests: Vec<Manifest>,
+}
+
+/// Device → server: the next chunk of an offered artifact, from `offset`.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct Fetch {
+    #[prost(uint32, tag = "1")]
+    pub kind: u32,
+    #[prost(uint32, tag = "2")]
+    pub version: u32,
+    #[prost(uint64, tag = "3")]
+    pub offset: u64,
+}
+
+/// Server → device: up to `MAX_CHUNK` bytes of the body at `offset`. Empty `bytes` means the
+/// artifact asked for is no longer offered.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct Chunk {
+    #[prost(uint32, tag = "1")]
+    pub kind: u32,
+    #[prost(uint32, tag = "2")]
+    pub version: u32,
+    #[prost(uint64, tag = "3")]
+    pub offset: u64,
+    #[prost(bytes = "vec", tag = "4")]
+    pub bytes: Vec<u8>,
+}
+
+/// Device → server: what became of an artifact (`Outcome`, and a `Reason` unless applied).
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct Report {
+    #[prost(uint32, tag = "1")]
+    pub kind: u32,
+    #[prost(uint32, tag = "2")]
+    pub version: u32,
+    #[prost(uint32, tag = "3")]
+    pub outcome: u32,
+    #[prost(uint32, tag = "4")]
+    pub reason: u32,
 }
 
 /// Device → server, first message of a session.

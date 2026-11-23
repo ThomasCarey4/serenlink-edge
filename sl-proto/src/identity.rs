@@ -78,8 +78,9 @@ impl IdentityCert {
         if ok { Ok(()) } else { Err(IdentityError::Bounds) }
     }
 
-    /// The identity key. Panics unless the key is 32 bytes: call only after `check_bounds`.
-    pub(crate) fn pubkey(&self) -> [u8; 32] {
+    /// The identity key. Panics unless the key is 32 bytes: call only on a certificate that
+    /// came through `verify_cert` or `verify_cert_signature`, which check the bounds.
+    pub fn public_key(&self) -> [u8; 32] {
         let mut out = [0u8; 32];
         out.copy_from_slice(&self.identity_pubkey);
         out
@@ -157,7 +158,7 @@ impl ServerIdentity {
         let signed = SignedIdentityCert::from_bytes(&cert)?;
         let body = parse_body(&signed.body)?;
         let key = SigningKey::from_bytes(&seed);
-        if body.pubkey() != key.verifying_key().to_bytes() {
+        if body.public_key() != key.verifying_key().to_bytes() {
             return Err(IdentityError::KeyMismatch);
         }
         Ok(Self {
@@ -184,11 +185,31 @@ impl ServerIdentity {
         &self.hostnames
     }
 
+    /// Signs `message` as it stands: the caller has already put a context in it.
+    pub(crate) fn sign_raw(&self, message: &[u8]) -> [u8; 64] {
+        self.key.sign(message).to_bytes()
+    }
+
     pub fn sign_challenge(&self, binding: &[u8; 32], nonce: &[u8; 32], device_id: &[u8], hostname: &str) -> [u8; 64] {
         self.key
             .sign(&server_message(binding, nonce, device_id, hostname))
             .to_bytes()
     }
+}
+
+/// The certificate's body, if a release key of `store` signed it and its serial is still
+/// trusted. Whom it names is the caller's business: a Challenge checks the hostname, a signed
+/// artifact checks nothing more.
+pub fn verify_cert(store: &crate::trust::TrustStore, cert: &[u8]) -> Result<IdentityCert, IdentityError> {
+    let signed = SignedIdentityCert::from_bytes(cert)?;
+    let release = store
+        .release_key(signed.release_key_id)
+        .ok_or(IdentityError::UnknownReleaseKey)?;
+    let body = verify_cert_signature(&signed, &release)?;
+    if !store.serial_ok(body.serial) {
+        return Err(IdentityError::Revoked);
+    }
+    Ok(body)
 }
 
 /// The device's check of a Challenge (spec 3.3, steps 2 to 5), against its own binding,
@@ -205,19 +226,12 @@ pub fn verify_identity(
     device_id: &[u8],
     hostname: &str,
 ) -> Result<(), IdentityError> {
-    let signed = SignedIdentityCert::from_bytes(cert)?;
-    let release = store
-        .release_key(signed.release_key_id)
-        .ok_or(IdentityError::UnknownReleaseKey)?;
-    let body = verify_cert_signature(&signed, &release)?;
-    if !store.serial_ok(body.serial) {
-        return Err(IdentityError::Revoked);
-    }
+    let body = verify_cert(store, cert)?;
     if !body.hostnames.iter().any(|h| h == hostname) {
         return Err(IdentityError::WrongHost);
     }
     if !verify(
-        &body.pubkey(),
+        &body.public_key(),
         &server_message(binding, nonce, device_id, hostname),
         sig,
     ) {

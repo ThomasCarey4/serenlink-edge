@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+pub mod artifact;
 pub mod auth;
 pub mod block;
 pub mod compress;
