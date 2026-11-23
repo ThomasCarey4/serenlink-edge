@@ -56,6 +56,9 @@ pub struct SessionConfig {
     /// The server name the device connected to; part of what it signs.
     pub hostname: String,
     pub firmware_version: u32,
+    /// The configuration the device runs. A device that has never applied a configuration
+    /// from the server runs its factory configuration, version 0, so the server's first
+    /// (version 1) is newer.
     pub config_version: u32,
     pub table_version: u32,
     /// Upper bound on batches produced by one `poll`.
