@@ -67,6 +67,11 @@ impl MemSink {
         self.applied.iter().rev().find(|(m, _)| m.kind() == Some(kind))
     }
 
+    /// The manifest of the partial (or verified, deferred) download held for `kind`.
+    pub fn partial(&self, kind: ArtifactKind) -> Option<&Manifest> {
+        self.partial[kind.index()].as_ref().map(|(m, _)| m)
+    }
+
     /// After a `Deferred`: make the partial for `m` active, as the shell does once its gates
     /// open. False if no partial for `m` is held.
     pub fn apply_now(&mut self, m: &Manifest) -> bool {
