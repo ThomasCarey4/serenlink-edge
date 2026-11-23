@@ -1,0 +1,313 @@
+//! The device's half of the control lane (spec 2): which offered artifacts to take, fetching
+//! them one chunk at a time, checking what arrived, and the reports the server is owed.
+//!
+//! `Control` sits beside `Session`, not inside it: the shell routes `Offer` and `Chunk` here
+//! while the session is `Active` and sends what `poll` returns after `Session::poll`, so data
+//! batches go first in each round and one `Fetch` in flight bounds what the lane costs them.
+use alloc::collections::BTreeSet;
+use alloc::vec::Vec;
+
+use sha2::{Digest, Sha256};
+use sl_proto::artifact::{ArtifactKind, Manifest, Outcome, Reason, verify_manifest};
+use sl_proto::trust::TrustStore;
+use sl_proto::wire::{Body, Chunk, Envelope, Fetch, Offer, Report};
+
+use crate::sink::{ApplyResult, ArtifactSink};
+use crate::storage::Storage;
+use crate::trust::TrustAnchor;
+
+/// What a `Chunk` changed that the shell must act on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    None,
+    /// The trust anchor took a new store: the shell hands it to the session.
+    TrustChanged,
+    /// `kind` now runs `version`.
+    Applied(ArtifactKind, u32),
+}
+
+/// The download under way: one at a time, across all kinds.
+struct Download {
+    m: Manifest,
+    kind: ArtifactKind,
+    /// The offset the next `Fetch` asks for; every byte below it is in the sink.
+    next: u64,
+    /// The body already failed its hash once and was fetched again from 0.
+    mismatched: bool,
+}
+
+pub struct Control {
+    device_id: [u8; 16],
+    /// By `ArtifactKind::index`; Trust's entry is unused (the trust store knows its version).
+    running: [u32; 4],
+    /// The current offer, by kind, with every manifest already verified.
+    offered: [Option<Manifest>; 4],
+    current: Option<Download>,
+    in_flight: bool,
+    /// (kind, version) already reported refused this session, so each is reported once.
+    refused: BTreeSet<(u32, u32)>,
+    /// Failed this session: not fetched again until the next one.
+    failed: BTreeSet<(ArtifactKind, u32)>,
+    /// The server answered an empty `Chunk`: no longer offered, until the next `Offer` says.
+    gone: BTreeSet<(ArtifactKind, u32)>,
+    reports: Vec<Report>,
+}
+
+fn report(kind: u32, version: u32, outcome: Outcome, reason: Reason) -> Report {
+    Report {
+        kind,
+        version,
+        outcome: outcome as u32,
+        reason: reason as u32,
+    }
+}
+
+impl Control {
+    /// `running[k.index()]` for Configuration, Tables, Firmware; Trust's entry is ignored
+    /// (the trust store's own version is used).
+    pub fn new(device_id: [u8; 16], running: [u32; 4]) -> Self {
+        Self {
+            device_id,
+            running,
+            offered: Default::default(),
+            current: None,
+            in_flight: false,
+            refused: BTreeSet::new(),
+            failed: BTreeSet::new(),
+            gone: BTreeSet::new(),
+            reports: Vec::new(),
+        }
+    }
+
+    pub fn running(&self, kind: ArtifactKind, trust: &TrustStore) -> u32 {
+        match kind {
+            ArtifactKind::Trust => trust.version,
+            k => self.running[k.index()],
+        }
+    }
+
+    /// The session ended. The sink keeps its partial, so the next session resumes it; what was
+    /// refused or failed is tried afresh, and queued reports wait for the next `poll`.
+    pub fn on_disconnected(&mut self) {
+        self.offered = Default::default();
+        self.current = None;
+        self.in_flight = false;
+        self.refused.clear();
+        self.failed.clear();
+        self.gone.clear();
+    }
+
+    /// Replace what is offered (spec 2.1). A manifest is believed only once it verifies; a
+    /// refusal is reported once per (kind, version) per session, so a server that keeps
+    /// offering the same bad manifest hears about it once.
+    pub fn on_offer(&mut self, offer: Offer, trust: &TrustStore) {
+        self.gone.clear();
+        let mut offered: [Option<Manifest>; 4] = Default::default();
+        for m in offer.manifests {
+            let kind = match verify_manifest(&m, trust, &self.device_id) {
+                Ok(kind) => kind,
+                Err(e) => {
+                    self.refuse(m.kind, m.version, e.reason());
+                    continue;
+                }
+            };
+            let running = self.running(kind, trust);
+            if m.version == running || self.failed.contains(&(kind, m.version)) {
+                continue;
+            }
+            if m.version < running {
+                self.refuse(m.kind, m.version, Reason::NotNewer);
+                continue;
+            }
+            // Two of one kind in one offer: the newer is the one worth having.
+            let slot = &mut offered[kind.index()];
+            if slot.as_ref().is_none_or(|held| held.version < m.version) {
+                *slot = Some(m);
+            }
+        }
+        self.offered = offered;
+        if let Some(d) = &self.current
+            && self.offered[d.kind.index()].as_ref() != Some(&d.m)
+        {
+            // Withdrawn: a Chunk still on its way for it is ignored, being no longer current.
+            self.drop_download();
+        }
+    }
+
+    fn refuse(&mut self, kind: u32, version: u32, reason: Reason) {
+        if self.refused.insert((kind, version)) {
+            self.reports.push(report(kind, version, Outcome::Refused, reason));
+        }
+    }
+
+    fn fail(&mut self, kind: ArtifactKind, version: u32, reason: Reason) {
+        self.failed.insert((kind, version));
+        self.reports.push(report(kind as u32, version, Outcome::Failed, reason));
+    }
+
+    /// End the current download; the `failed` and `gone` sets, or the offer, say whether it
+    /// starts again.
+    fn drop_download(&mut self) {
+        self.current = None;
+        self.in_flight = false;
+    }
+
+    /// Queued reports, then at most one `Fetch` (spec 2.2): nothing is fetched while one is
+    /// unanswered, and the next download is the first offered kind in `FETCH_ORDER`.
+    pub fn poll<K: ArtifactSink>(&mut self, sink: &mut K) -> Vec<Envelope> {
+        let mut out: Vec<Envelope> = self.reports.drain(..).map(|r| Envelope::of(Body::Report(r))).collect();
+        if self.in_flight {
+            return out;
+        }
+        if self.current.is_none() {
+            self.start(sink);
+        }
+        // `start` may have queued a storage failure.
+        out.extend(self.reports.drain(..).map(|r| Envelope::of(Body::Report(r))));
+        if let Some(d) = &self.current {
+            out.push(Envelope::of(Body::Fetch(Fetch {
+                kind: d.kind as u32,
+                version: d.m.version,
+                offset: d.next,
+            })));
+            self.in_flight = true;
+        }
+        out
+    }
+
+    /// Start the first download the offer allows, resuming the sink's partial when it is of
+    /// the same version. A partial already whole resumes at its last byte: `Fetch.offset` is
+    /// always below the size, and that byte arriving completes it and runs the check.
+    fn start<K: ArtifactSink>(&mut self, sink: &mut K) {
+        for kind in ArtifactKind::FETCH_ORDER {
+            let Some(m) = self.offered[kind.index()].clone() else {
+                continue;
+            };
+            if self.gone.contains(&(kind, m.version)) || self.failed.contains(&(kind, m.version)) {
+                continue;
+            }
+            let next = match sink.progress(kind) {
+                Some((version, held)) if version == m.version && held <= m.size => held.min(m.size - 1),
+                _ => {
+                    if sink.begin(&m).is_err() {
+                        self.fail(kind, m.version, Reason::Storage);
+                        continue;
+                    }
+                    0
+                }
+            };
+            self.current = Some(Download {
+                m,
+                kind,
+                next,
+                mismatched: false,
+            });
+            return;
+        }
+    }
+
+    /// The answer to the `Fetch` in flight (spec 2.2, 2.3). A chunk at the wrong offset or
+    /// past the size is dropped and the next `poll` asks again; the body is believed only once
+    /// all of it has been read back from the sink and its hash matches the manifest.
+    pub fn on_chunk<K: ArtifactSink, S: Storage>(
+        &mut self,
+        chunk: Chunk,
+        sink: &mut K,
+        anchor: &mut TrustAnchor,
+        storage: &mut S,
+    ) -> Event {
+        let Some(d) = &mut self.current else {
+            return Event::None;
+        };
+        if !self.in_flight || chunk.kind != d.kind as u32 || chunk.version != d.m.version {
+            return Event::None;
+        }
+        self.in_flight = false;
+        let (kind, version) = (d.kind, d.m.version);
+        if chunk.bytes.is_empty() {
+            self.gone.insert((kind, version));
+            self.drop_download();
+            return Event::None;
+        }
+        let len = chunk.bytes.len() as u64;
+        if chunk.offset != d.next || chunk.offset.checked_add(len).is_none_or(|end| end > d.m.size) {
+            return Event::None;
+        }
+        if sink.write(kind, chunk.offset, &chunk.bytes).is_err() {
+            self.drop_download();
+            self.fail(kind, version, Reason::Storage);
+            return Event::None;
+        }
+        d.next += len;
+        if d.next < d.m.size {
+            return Event::None;
+        }
+        match body_hash(sink, kind, d.m.size) {
+            None => {
+                self.drop_download();
+                self.fail(kind, version, Reason::Storage);
+                Event::None
+            }
+            Some(sha) if Some(sha) == d.m.sha() => {
+                let m = d.m.clone();
+                // The download is over whatever `complete` decides; the offer no longer holds it.
+                self.drop_download();
+                self.offered[kind.index()] = None;
+                self.complete(&m, kind, sink, anchor, storage)
+            }
+            Some(_) if !d.mismatched => {
+                d.mismatched = true;
+                d.next = 0;
+                if sink.begin(&d.m).is_err() {
+                    self.drop_download();
+                    self.fail(kind, version, Reason::Storage);
+                }
+                Event::None
+            }
+            Some(_) => {
+                self.drop_download();
+                self.fail(kind, version, Reason::Hash);
+                Event::None
+            }
+        }
+    }
+
+    /// A verified body: make it active. Only the plain `Applied` path is here yet; applying a
+    /// trust store through `anchor`, and deferred and failed applies, come with the rest of
+    /// spec 2.3.
+    fn complete<K: ArtifactSink, S: Storage>(
+        &mut self,
+        m: &Manifest,
+        kind: ArtifactKind,
+        sink: &mut K,
+        _anchor: &mut TrustAnchor,
+        _storage: &mut S,
+    ) -> Event {
+        if kind == ArtifactKind::Trust {
+            return Event::None;
+        }
+        if sink.apply(m) == ApplyResult::Applied {
+            self.reports
+                .push(report(kind as u32, m.version, Outcome::Applied, Reason::None));
+        }
+        Event::None
+    }
+}
+
+/// The sha256 of the first `size` bytes of `kind`'s partial, read back 1 KiB at a time so the
+/// check is of what the sink holds, not of what arrived; `None` if the sink cannot give them.
+fn body_hash<K: ArtifactSink>(sink: &K, kind: ArtifactKind, size: u64) -> Option<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 1024];
+    let mut at = 0u64;
+    while at < size {
+        let want = (size - at).min(buf.len() as u64) as usize;
+        let n = sink.read(kind, at, &mut buf[..want]).ok()?;
+        if n == 0 {
+            return None;
+        }
+        hasher.update(&buf[..n]);
+        at += n as u64;
+    }
+    Some(hasher.finalize().into())
+}
