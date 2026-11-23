@@ -114,7 +114,7 @@ impl Reason {
     }
 }
 
-#[derive(Clone, PartialEq, prost::Message)]
+#[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct Manifest {
     #[prost(uint32, tag = "1")]
     pub kind: u32,
