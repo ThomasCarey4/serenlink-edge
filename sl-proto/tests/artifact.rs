@@ -3,6 +3,7 @@ use sl_proto::artifact::{
     ArtifactKind, Manifest, ManifestError, Outcome, Reason, Signer, body_matches, verify_manifest,
 };
 use sl_proto::identity::{IdentityCert, ServerIdentity, SignedIdentityCert};
+use sl_proto::lp::signed_message;
 use sl_proto::trust::{ReleaseKey, TrustStore};
 use sl_proto::wire::{Body, Chunk, Envelope, Fetch, Offer, Report};
 
@@ -73,7 +74,11 @@ fn every_signed_field_is_covered() {
     for field in ["kind", "version", "size", "sha256"] {
         let mut m = release(ArtifactKind::Tables);
         flip(&mut m, field);
-        assert_eq!(verify_manifest(&m, &s, &DEVICE), Err(ManifestError::Signature), "{field}");
+        assert_eq!(
+            verify_manifest(&m, &s, &DEVICE),
+            Err(ManifestError::Signature),
+            "{field}"
+        );
     }
     let mut m = config();
     flip(&mut m, "device_id");
@@ -192,4 +197,35 @@ fn an_old_peer_skips_the_new_bodies() {
     }))
     .encode_to_vec();
     assert_eq!(OldEnvelope::decode(bytes.as_slice()).unwrap().body, None);
+}
+
+#[test]
+fn malformed_manifests_are_refused() {
+    let s = store(&[]);
+    let mut m = release(ArtifactKind::Tables);
+    m.kind = 9;
+    assert_eq!(verify_manifest(&m, &s, &DEVICE), Err(ManifestError::Malformed));
+    for len in [0, 31, 33] {
+        let mut m = release(ArtifactKind::Tables);
+        m.sha256 = vec![0; len];
+        assert_eq!(verify_manifest(&m, &s, &DEVICE), Err(ManifestError::Malformed), "{len}");
+    }
+    // Correctly signed, but a release kind has no device: the signature is made by hand over
+    // the same layout `Manifest::sign_release` uses, with a device id in it.
+    let mut m = release(ArtifactKind::Tables);
+    m.device_id = DEVICE.to_vec();
+    let message = signed_message(
+        b"serenlink-artifact-v1",
+        &[
+            &m.kind.to_le_bytes(),
+            &m.version.to_le_bytes(),
+            &m.size.to_le_bytes(),
+            &m.sha256,
+            &m.device_id,
+        ],
+    );
+    m.sig = ed25519_dalek::Signer::sign(&ed25519_dalek::SigningKey::from_bytes(&RELEASE), &message)
+        .to_bytes()
+        .to_vec();
+    assert_eq!(verify_manifest(&m, &s, &DEVICE), Err(ManifestError::Malformed));
 }

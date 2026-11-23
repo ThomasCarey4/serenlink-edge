@@ -144,7 +144,13 @@ pub struct Manifest {
 fn message(kind: u32, version: u32, size: u64, sha256: &[u8], device_id: &[u8]) -> Vec<u8> {
     signed_message(
         CONTEXT,
-        &[&kind.to_le_bytes(), &version.to_le_bytes(), &size.to_le_bytes(), sha256, device_id],
+        &[
+            &kind.to_le_bytes(),
+            &version.to_le_bytes(),
+            &size.to_le_bytes(),
+            sha256,
+            device_id,
+        ],
     )
 }
 
@@ -237,11 +243,7 @@ impl ManifestError {
 /// signer must be the one the kind allows, a release key of `store`, or an identity
 /// certificate a release key of `store` signed and whose serial `store.serial_ok`. Then the
 /// size (0 < size <= the kind's limit), then, for configuration, that it is for this device.
-pub fn verify_manifest(
-    m: &Manifest,
-    store: &TrustStore,
-    device_id: &[u8; 16],
-) -> Result<ArtifactKind, ManifestError> {
+pub fn verify_manifest(m: &Manifest, store: &TrustStore, device_id: &[u8; 16]) -> Result<ArtifactKind, ManifestError> {
     let kind = m.kind().ok_or(ManifestError::Malformed)?;
     if m.sha256.len() != 32 {
         return Err(ManifestError::Malformed);
