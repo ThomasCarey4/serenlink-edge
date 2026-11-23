@@ -2,6 +2,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use sl_proto::artifact::ArtifactKind;
 use sl_proto::auth::{Signer, auth_message};
 use sl_proto::identity::verify_identity;
 use sl_proto::ids::Class;
@@ -121,6 +122,16 @@ impl<G: Signer> Session<G> {
     /// After the shell's `TrustAnchor` accepted a new store.
     pub fn set_trust(&mut self, trust: TrustStore) {
         self.trust = trust;
+    }
+
+    /// The Hello's version of `kind` from now on. Trust is ignored: it follows `set_trust`.
+    pub fn set_running(&mut self, kind: ArtifactKind, version: u32) {
+        match kind {
+            ArtifactKind::Configuration => self.cfg.config_version = version,
+            ArtifactKind::Tables => self.cfg.table_version = version,
+            ArtifactKind::Firmware => self.cfg.firmware_version = version,
+            ArtifactKind::Trust => {}
+        }
     }
 
     pub fn phase(&self) -> Phase {
@@ -325,6 +336,8 @@ impl<G: Signer> Session<G> {
                 }
                 Ok(Vec::new())
             }
+            // The control lane's: the shell routes these to `Control`.
+            (Phase::Active, Body::Offer(_) | Body::Chunk(_)) => Ok(Vec::new()),
             _ => Err(SessionError::Unexpected),
         }
     }

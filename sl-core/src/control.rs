@@ -9,12 +9,12 @@ use alloc::vec::Vec;
 
 use sha2::{Digest, Sha256};
 use sl_proto::artifact::{ArtifactKind, MAX_CHUNK, Manifest, Outcome, Reason, verify_manifest};
-use sl_proto::trust::TrustStore;
+use sl_proto::trust::{MAX_TRUST_STORE_BYTES, SignedTrustStore, TrustError, TrustStore};
 use sl_proto::wire::{Body, Chunk, Envelope, Fetch, Offer, Report};
 
 use crate::sink::{ApplyResult, ArtifactSink};
 use crate::storage::Storage;
-use crate::trust::TrustAnchor;
+use crate::trust::{OfferError, TrustAnchor};
 
 /// What a `Chunk` changed that the shell must act on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +53,9 @@ pub struct Control {
     failed: BTreeSet<(ArtifactKind, u32)>,
     /// The server answered an empty `Chunk`: no longer offered, until the next `Offer` says.
     gone: BTreeSet<(ArtifactKind, u32)>,
+    /// Verified and held by the sink, waiting on the device's own gates for `finish`. Kept
+    /// across sessions: the shell may apply one long after the link dropped.
+    deferred: Vec<Manifest>,
     reports: Vec<Report>,
 }
 
@@ -78,6 +81,7 @@ impl Control {
             refused: BTreeSet::new(),
             failed: BTreeSet::new(),
             gone: BTreeSet::new(),
+            deferred: Vec::new(),
             reports: Vec::new(),
         }
     }
@@ -115,7 +119,13 @@ impl Control {
                 }
             };
             let running = self.running(kind, trust);
-            if m.version == running || self.failed.contains(&(kind, m.version)) {
+            if m.version == running
+                || self.failed.contains(&(kind, m.version))
+                || self
+                    .deferred
+                    .iter()
+                    .any(|d| d.kind() == Some(kind) && d.version == m.version)
+            {
                 continue;
             }
             if m.version < running {
@@ -284,25 +294,100 @@ impl Control {
         }
     }
 
-    /// A verified body: make it active. Only the plain `Applied` path is here yet; applying a
-    /// trust store through `anchor`, and deferred and failed applies, come with the rest of
-    /// spec 2.3.
+    /// The shell's word on a deferred apply of (`kind`, `version`): `Applied` once it is
+    /// running, or `Failed`. Anything that is not a deferred apply is ignored. The report waits
+    /// for the next `poll`, which may be in a later session.
+    pub fn finish(&mut self, kind: ArtifactKind, version: u32, outcome: Outcome, reason: Reason) {
+        let Some(at) = self
+            .deferred
+            .iter()
+            .position(|m| m.kind() == Some(kind) && m.version == version)
+        else {
+            return;
+        };
+        self.deferred.remove(at);
+        if outcome == Outcome::Applied && kind != ArtifactKind::Trust {
+            self.running[kind.index()] = version;
+        }
+        self.reports.push(report(kind as u32, version, outcome, reason));
+    }
+
+    /// A verified body: make it active (spec 2.3).
     fn complete<K: ArtifactSink, S: Storage>(
         &mut self,
         m: &Manifest,
         kind: ArtifactKind,
         sink: &mut K,
-        _anchor: &mut TrustAnchor,
-        _storage: &mut S,
+        anchor: &mut TrustAnchor,
+        storage: &mut S,
     ) -> Event {
         if kind == ArtifactKind::Trust {
-            return Event::None;
+            return self.complete_trust(m, sink, anchor, storage);
         }
-        if sink.apply(m) == ApplyResult::Applied {
-            self.reports
-                .push(report(kind as u32, m.version, Outcome::Applied, Reason::None));
+        match sink.apply(m) {
+            ApplyResult::Applied => {
+                self.running[kind.index()] = m.version;
+                self.reports
+                    .push(report(kind as u32, m.version, Outcome::Applied, Reason::None));
+                Event::Applied(kind, m.version)
+            }
+            ApplyResult::Deferred => {
+                self.deferred.push(m.clone());
+                Event::None
+            }
+            ApplyResult::Failed => {
+                self.fail(kind, m.version, Reason::Apply);
+                Event::None
+            }
         }
-        Event::None
+    }
+
+    fn complete_trust<K: ArtifactSink, S: Storage>(
+        &mut self,
+        m: &Manifest,
+        sink: &K,
+        anchor: &mut TrustAnchor,
+        storage: &mut S,
+    ) -> Event {
+        let v = m.version;
+        let refuse = |c: &mut Self, reason| {
+            // Not fetched again this session: the same bytes would be refused again.
+            c.failed.insert((ArtifactKind::Trust, v));
+            c.reports
+                .push(report(ArtifactKind::Trust as u32, v, Outcome::Refused, reason));
+            Event::None
+        };
+        let size = m.size as usize;
+        if size > MAX_TRUST_STORE_BYTES {
+            return refuse(self, Reason::TooBig);
+        }
+        let mut bytes = alloc::vec![0u8; size];
+        let mut at = 0;
+        while at < size {
+            match sink.read(ArtifactKind::Trust, at as u64, &mut bytes[at..]) {
+                Ok(n) if n > 0 => at += n,
+                _ => {
+                    self.fail(ArtifactKind::Trust, v, Reason::Storage);
+                    return Event::None;
+                }
+            }
+        }
+        let Ok(signed) = SignedTrustStore::from_bytes(&bytes) else {
+            return refuse(self, Reason::Signature);
+        };
+        match anchor.offer(storage, &signed) {
+            Ok(()) => {
+                self.reports
+                    .push(report(ArtifactKind::Trust as u32, v, Outcome::Applied, Reason::None));
+                Event::TrustChanged
+            }
+            Err(OfferError::Refused(TrustError::NotNewer)) => refuse(self, Reason::NotNewer),
+            Err(OfferError::Refused(_)) => refuse(self, Reason::Signature),
+            Err(OfferError::Storage(_)) => {
+                self.fail(ArtifactKind::Trust, v, Reason::Storage);
+                Event::None
+            }
+        }
     }
 }
 

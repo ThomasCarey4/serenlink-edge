@@ -471,3 +471,121 @@ fn a_refusal_is_reported_again_in_the_next_session() {
         vec![rep(Tables, 4, Outcome::Refused, Reason::NotNewer)]
     );
 }
+
+fn signed_store(s: &TrustStore) -> Vec<u8> {
+    SignedTrustStore::sign(s, 1, &RELEASE).to_bytes()
+}
+
+#[test]
+fn a_trust_store_is_applied_through_the_anchor() {
+    let mut r = Rig::new();
+    let mut next = store(2);
+    next.release_keys.push(ReleaseKey {
+        id: 2,
+        pubkey: public(&OTHER),
+    });
+    let t = r.release(Trust, 2, signed_store(&next));
+    r.offer(vec![t]);
+    let mut events = Vec::new();
+    let mut seen = Vec::new();
+    for _ in 0..100 {
+        let out = r.poll();
+        if out.is_empty() {
+            break;
+        }
+        for e in &out {
+            if let Some(Body::Fetch(f)) = &e.body {
+                let c = r.answer(f);
+                events.push(r.chunk(c));
+            }
+        }
+        seen.extend(out);
+    }
+    assert!(events.contains(&Event::TrustChanged));
+    assert_eq!(r.anchor.active().version, 2);
+    assert_eq!(reports(&seen), vec![rep(Trust, 2, Outcome::Applied, Reason::None)]);
+
+    // A manifest signed by the new key now verifies and downloads.
+    let b = body(100, 3);
+    let m = Manifest::sign_release(Tables, 2, &b, 2, &OTHER);
+    r.bodies.insert((Tables as u32, 2), b.clone());
+    r.offer(vec![m.clone()]);
+    let out = r.pump();
+    assert_eq!(r.sink.applied().last(), Some(&(m, b)));
+    assert_eq!(reports(&out), vec![rep(Tables, 2, Outcome::Applied, Reason::None)]);
+}
+
+#[test]
+fn a_trust_store_the_anchor_refuses_is_reported() {
+    let mut r = Rig::new();
+    // The manifest is newer than the active store; the store inside is not.
+    let t = r.release(Trust, 2, signed_store(&store(1)));
+    r.offer(vec![t]);
+    let out = r.pump();
+    assert_eq!(reports(&out), vec![rep(Trust, 2, Outcome::Refused, Reason::NotNewer)]);
+    assert_eq!(r.anchor.active().version, 1);
+}
+
+#[test]
+fn a_garbled_trust_store_is_refused_as_a_signature() {
+    let mut r = Rig::new();
+    let t = r.release(Trust, 2, vec![1, 2, 3]);
+    r.offer(vec![t]);
+    let out = r.pump();
+    assert_eq!(reports(&out), vec![rep(Trust, 2, Outcome::Refused, Reason::Signature)]);
+}
+
+#[test]
+fn a_deferred_apply_reports_on_finish() {
+    let mut r = Rig::new();
+    r.sink.set_defer(true);
+    let t = r.release(Tables, 2, body(100, 1));
+    r.offer(vec![t.clone()]);
+    let out = r.pump();
+    assert!(reports(&out).is_empty());
+    assert_eq!(r.control.running(Tables, r.anchor.active()), 1);
+    // Offered again while deferred: not downloaded again.
+    r.offer(vec![t.clone()]);
+    assert!(r.poll().is_empty());
+
+    r.sink.apply_now(&t);
+    r.control.finish(Tables, 2, Outcome::Applied, Reason::None);
+    assert_eq!(r.control.running(Tables, r.anchor.active()), 2);
+    assert_eq!(reports(&r.poll()), vec![rep(Tables, 2, Outcome::Applied, Reason::None)]);
+    // Only once.
+    r.control.finish(Tables, 2, Outcome::Applied, Reason::None);
+    assert!(r.poll().is_empty());
+}
+
+#[test]
+fn finish_ignores_what_is_not_deferred() {
+    let mut r = Rig::new();
+    r.control.finish(Tables, 9, Outcome::Applied, Reason::None);
+    assert!(r.poll().is_empty());
+    assert_eq!(r.control.running(Tables, r.anchor.active()), 1);
+}
+
+#[test]
+fn a_deferred_apply_survives_a_disconnect() {
+    let mut r = Rig::new();
+    r.sink.set_defer(true);
+    let t = r.release(Tables, 2, body(100, 1));
+    r.offer(vec![t.clone()]);
+    r.pump();
+    r.control.on_disconnected();
+    r.sink.apply_now(&t);
+    r.control.finish(Tables, 2, Outcome::Applied, Reason::None);
+    r.control.on_disconnected();
+    assert_eq!(reports(&r.poll()), vec![rep(Tables, 2, Outcome::Applied, Reason::None)]);
+}
+
+#[test]
+fn a_failed_apply_is_reported() {
+    let mut r = Rig::new();
+    r.sink.fail_next_apply();
+    let t = r.release(Tables, 2, body(100, 1));
+    r.offer(vec![t]);
+    let out = r.pump();
+    assert_eq!(reports(&out), vec![rep(Tables, 2, Outcome::Failed, Reason::Apply)]);
+    assert_eq!(r.control.running(Tables, r.anchor.active()), 1);
+}

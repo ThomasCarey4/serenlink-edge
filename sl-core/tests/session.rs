@@ -4,10 +4,13 @@ use common::keys;
 use sl_core::log::DurableLog;
 use sl_core::mem_storage::MemStorage;
 use sl_core::session::{Phase, Session, SessionConfig, SessionError};
+use sl_proto::artifact::ArtifactKind;
 use sl_proto::auth::{KeySigner, Signer, auth_message, verify};
 use sl_proto::identity::ServerIdentity;
 use sl_proto::ids::Class;
-use sl_proto::wire::{Ack, Batch, Body, Challenge, Credit, DeviceState, Envelope, Mark, Resync, Rewind, Welcome};
+use sl_proto::wire::{
+    Ack, Batch, Body, Challenge, Chunk, Credit, DeviceState, Envelope, Mark, Offer, Resync, Rewind, Welcome,
+};
 
 const DEVICE: [u8; 16] = [0xd1; 16];
 const HOST: &str = "ingest.example";
@@ -1097,4 +1100,43 @@ fn a_disconnect_before_the_anchor_is_taken_drops_it() {
     s.on_message(welcome_at(1_767_225_600_000), &mut log).unwrap();
     s.on_disconnected();
     assert_eq!(s.take_anchor(10_300), None);
+}
+
+#[test]
+fn the_hello_names_what_runs() {
+    let mut s = session();
+    let log = log_with(0, 0);
+    s.set_running(ArtifactKind::Tables, 7);
+    s.set_running(ArtifactKind::Configuration, 8);
+    s.set_running(ArtifactKind::Firmware, 9);
+    s.set_running(ArtifactKind::Trust, 99);
+    let Some(Body::Hello(hello)) = s.on_connected(&log, [0xB1; 32], 0).unwrap().body else {
+        panic!("expected Hello");
+    };
+    assert_eq!(
+        (hello.table_version, hello.config_version, hello.firmware_version),
+        (7, 8, 9)
+    );
+    assert_eq!(hello.trust_version, 1);
+}
+
+#[test]
+fn the_session_lets_control_messages_pass() {
+    let mut s = session();
+    let mut log = log_with(0, 0);
+    let offer = || Envelope::of(Body::Offer(Offer { manifests: vec![] }));
+    let chunk = || {
+        Envelope::of(Body::Chunk(Chunk {
+            kind: 1,
+            version: 1,
+            offset: 0,
+            bytes: vec![],
+        }))
+    };
+    assert_eq!(s.on_message(offer(), &mut log), Err(SessionError::Unexpected));
+    s.on_connected(&log, [0xB1; 32], 0).unwrap();
+    assert_eq!(s.on_message(chunk(), &mut log), Err(SessionError::Unexpected));
+    fresh(&mut s, &mut log);
+    assert_eq!(s.on_message(offer(), &mut log), Ok(vec![]));
+    assert_eq!(s.on_message(chunk(), &mut log), Ok(vec![]));
 }
