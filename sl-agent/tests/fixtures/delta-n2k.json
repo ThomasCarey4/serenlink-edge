@@ -1,0 +1,13 @@
+{"context":"vessels.urn:mrn:imo:mmsi:000000000","updates":[
+ {"source":{"label":"can0","type":"NMEA2000","pgn":129025,"src":"115"},"$source":"can0.115",
+  "timestamp":"2026-11-24T10:00:00.000Z",
+  "values":[{"path":"navigation.position","value":{"longitude":-1.25,"latitude":50.75}}]},
+ {"source":{"label":"can0","type":"NMEA2000","pgn":128259,"src":"35"},"$source":"can0.35",
+  "timestamp":"2026-11-24T10:00:00.100Z",
+  "values":[{"path":"navigation.speedThroughWater","value":2.31},
+            {"path":"navigation.log","value":null}]},
+ {"$source":"venus.com.victronenergy.battery","timestamp":"2026-11-24T10:00:00.200Z",
+  "values":[{"path":"electrical.batteries.0.voltage","value":13.21},
+            {"path":"electrical.batteries.0.name","value":"House"}],
+  "meta":[{"path":"electrical.batteries.0.voltage","value":{"units":"V"}}]}
+]}

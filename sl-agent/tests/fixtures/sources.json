@@ -1,0 +1,4 @@
+{"can0":{"label":"can0","type":"NMEA2000",
+  "115":{"n2k":{"src":"115","canName":"c0788c00e7e04312","manufacturerCode":"Garmin"}},
+  "35":{"n2k":{"src":"35","canName":"c050a0002fa00b9e"}}},
+ "venus":{"label":"venus","type":"Venus"}}
