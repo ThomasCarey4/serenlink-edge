@@ -360,7 +360,7 @@ pub async fn run(args: Args) -> Result<(), String> {
         eprintln!("declaring the losses found at open failed ({e:?}); the next tick declares them");
     }
     eprintln!(
-        "boot {boot_id}; log P0 {} P1 {} P2 {} frames; torn bytes {:?}; {} corrupt ranges",
+        "boot {boot_id}; log P0 {} P1 {} P2 {} records; torn bytes {:?}; {} corrupt ranges",
         dev.log().next_seq(Class::P0),
         dev.log().next_seq(Class::P1),
         dev.log().next_seq(Class::P2),
