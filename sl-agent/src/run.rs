@@ -4,6 +4,11 @@
 //! A storage error is a reboot, as in the simulator's boat: the loop closes the socket and
 //! `run` returns an error, so the process exits non-zero and systemd starts a new boot that
 //! reopens and recovers the log.
+//!
+//! Recording never waits on the network: SignalK updates are stamped when they arrive, and a
+//! gateway connection writes on its own task through a bounded queue (`Link`). A full queue, a
+//! send that waits longer than the gateway's idle timeout, or a gateway silent that long drops
+//! the session, which the device rewinds on its next Hello.
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
@@ -11,6 +16,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use clap::Parser;
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as _;
 use sl_core::device::{Device, DeviceConfig};
@@ -21,10 +27,13 @@ use sl_proto::compress::Compression;
 use sl_proto::ids::Class;
 use sl_proto::trust::SignedTrustStore;
 use sl_proto::wire::{Body, Envelope};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
-use tokio::time::{Instant, MissedTickBehavior, interval};
-use tokio_tungstenite::tungstenite::Message;
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout, timeout_at};
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::{self, Message};
 
 use crate::clock::Clock;
 use crate::defines::{Defines, to_value};
@@ -46,6 +55,12 @@ const CONNECT_WITHIN: Duration = Duration::from_secs(15);
 const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
 const INTAKE: usize = 8_192;
+/// The gateway's idle timeout (`sl-gateway serve --idle-secs`, default 90; it pings every 30):
+/// a gateway heard from for no longer than this is gone, and so is a send that waits this long.
+const GATEWAY_IDLE: Duration = Duration::from_secs(90);
+/// Messages queued for a connection's writer. The device sends only what the gateway's credit
+/// allows, so this fills only when the uplink has stopped; then the session is dropped.
+const OUT_QUEUE: usize = 1_024;
 
 #[derive(Parser, Debug, Clone)]
 #[command(about = "SerenLink agent: records a SignalK server into the durable log and uploads it")]
@@ -93,7 +108,8 @@ type Connecting = Pin<Box<dyn Future<Output = Result<(Ws, [u8; 32]), String>>>>;
 /// SignalK into `tx` for ever, reconnecting with backoff; `$source` NAMEs refreshed from the
 /// sources document at each connect and when an unknown source appears (at most once a minute).
 /// An update that finds the channel full is dropped and counted.
-async fn signalk(url: String, tx: mpsc::Sender<(Update, u64)>) {
+/// Each update goes with its `$source` NAME and the time it arrived, on the agent's clock.
+async fn signalk(url: String, clock: Clock, tx: mpsc::Sender<(Update, u64, u64)>) {
     let mut backoff = Duration::from_secs(1);
     let names_url = sources_url(&url);
     let mut known: HashMap<String, u64> = HashMap::new();
@@ -119,6 +135,7 @@ async fn signalk(url: String, tx: mpsc::Sender<(Update, u64)>) {
                             break;
                         }
                     };
+                    let mono = clock.mono_ms();
                     let Message::Text(text) = msg else { continue };
                     for u in parse_delta(text.as_str()) {
                         if !known.contains_key(&u.source)
@@ -143,7 +160,7 @@ async fn signalk(url: String, tx: mpsc::Sender<(Update, u64)>) {
                             }
                         }
                         let name = known.get(&u.source).copied().unwrap_or(0);
-                        match tx.try_send((u, name)) {
+                        match tx.try_send((u, name, mono)) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
                                 // The device task is far behind: dropping is the intake budget.
@@ -165,17 +182,108 @@ async fn signalk(url: String, tx: mpsc::Sender<(Update, u64)>) {
     }
 }
 
-/// `d` lengthened by up to a quarter, by `r` (any u32; its value mod 1000 is used).
-fn jittered(d: Duration, r: u32) -> Duration {
-    d + d.mul_f64(f64::from(r % 1000) / 4000.0)
+/// `d` lengthened by up to a quarter, by `r` (any value; `r % 1000` is used).
+fn jittered(d: Duration, r: u64) -> Duration {
+    d + d.mul_f64((r % 1000) as f64 / 4000.0)
 }
 
 fn jitter(d: Duration) -> Duration {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|t| t.subsec_nanos())
-        .unwrap_or(0);
-    jittered(d, nanos)
+    use std::hash::{BuildHasher, Hasher};
+    // Each RandomState is freshly keyed: a random u64 with no extra dependency.
+    let r = std::collections::hash_map::RandomState::new().build_hasher().finish();
+    jittered(d, r)
+}
+
+/// What a connection has for the loop.
+enum LinkEvent {
+    Msg(Option<Result<Message, tungstenite::Error>>),
+    /// The writer stopped: a send failed or waited `GATEWAY_IDLE`.
+    WriterEnded(String),
+    /// Nothing heard from the gateway for `GATEWAY_IDLE`: the connection is half-open.
+    Silent,
+}
+
+/// One gateway connection: read here, written by its own task through a bounded queue.
+struct Link<T> {
+    read: SplitStream<WebSocketStream<T>>,
+    out: mpsc::Sender<Message>,
+    writer: JoinHandle<Result<(), String>>,
+    heard: Instant,
+}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Link<T> {
+    fn new(ws: WebSocketStream<T>) -> Self {
+        let (sink, read) = ws.split();
+        let (out, rx) = mpsc::channel(OUT_QUEUE);
+        Self {
+            read,
+            out,
+            writer: tokio::spawn(write(sink, rx)),
+            heard: Instant::now(),
+        }
+    }
+
+    /// Queue `out` without waiting. An error means a frame did not go: drop the session, so
+    /// the device rewinds to it on the next Hello.
+    fn queue(&self, out: Vec<Envelope>) -> Result<(), &'static str> {
+        for env in out {
+            self.out
+                .try_send(Message::Binary(env.encode_to_vec().into()))
+                .map_err(|e| match e {
+                    mpsc::error::TrySendError::Full(_) => "the send queue is full",
+                    mpsc::error::TrySendError::Closed(_) => "the writer has stopped",
+                })?;
+        }
+        Ok(())
+    }
+
+    /// The next thing to act on. Cancel-safe: a select may drop it at any await.
+    async fn next(&mut self) -> LinkEvent {
+        tokio::select! {
+            m = self.read.next() => {
+                if matches!(m, Some(Ok(_))) {
+                    self.heard = Instant::now();
+                }
+                LinkEvent::Msg(m)
+            }
+            r = &mut self.writer => LinkEvent::WriterEnded(match r {
+                Ok(Ok(())) => "the writer ended".into(),
+                Ok(Err(e)) => e,
+                Err(e) => format!("the writer failed: {e}"),
+            }),
+            _ = sleep_until(self.heard + GATEWAY_IDLE) => LinkEvent::Silent,
+        }
+    }
+
+    /// Drop the connection now, whatever is queued.
+    fn abort(self) {
+        self.writer.abort();
+    }
+
+    /// Send what is queued, then a Close, by `deadline`.
+    async fn finish(self, deadline: Instant) {
+        let Self { out, mut writer, .. } = self;
+        drop(out);
+        if timeout_at(deadline, &mut writer).await.is_err() {
+            writer.abort();
+        }
+    }
+}
+
+/// A connection's writer: each send bounded by `GATEWAY_IDLE`; when the queue closes, a Close.
+async fn write<T: AsyncRead + AsyncWrite + Unpin>(
+    mut sink: SplitSink<WebSocketStream<T>, Message>,
+    mut rx: mpsc::Receiver<Message>,
+) -> Result<(), String> {
+    while let Some(m) = rx.recv().await {
+        match timeout(GATEWAY_IDLE, sink.send(m)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(format!("sending: {e}")),
+            Err(_) => return Err(format!("a send waited {GATEWAY_IDLE:?}")),
+        }
+    }
+    let _ = timeout(Duration::from_secs(1), sink.close()).await;
+    Ok(())
 }
 
 /// The reconnect schedule: a failed attempt or a lost session waits the backoff (jittered),
@@ -263,8 +371,8 @@ pub async fn run(args: Args) -> Result<(), String> {
         dev.anchor(a);
     }
 
-    let (tx, mut rx) = mpsc::channel::<(Update, u64)>(INTAKE);
-    tokio::spawn(signalk(args.signalk_url.clone(), tx));
+    let (tx, mut rx) = mpsc::channel::<(Update, u64, u64)>(INTAKE);
+    tokio::spawn(signalk(args.signalk_url.clone(), clock, tx));
 
     let mut policy = Policy::new();
     let mut defines = Defines::new();
@@ -275,13 +383,13 @@ pub async fn run(args: Args) -> Result<(), String> {
     let mut fill = interval(FILL_EVERY);
     let mut term = signal(SignalKind::terminate()).map_err(|e| e.to_string())?;
     let mut int = signal(SignalKind::interrupt()).map_err(|e| e.to_string())?;
-    let mut ws: Option<Ws> = None;
+    let mut link: Option<Link<Tls>> = None;
     let mut connecting: Option<Connecting> = None;
     let mut retry = Retry::new();
     let mut welcomed = false;
 
     loop {
-        if ws.is_none() && connecting.is_none() && Instant::now() >= retry.at {
+        if link.is_none() && connecting.is_none() && Instant::now() >= retry.at {
             let (addr, hostname, tls) = (addr.clone(), hostname.clone(), tls.clone());
             connecting = Some(Box::pin(async move {
                 match tokio::time::timeout(CONNECT_WITHIN, connect(&addr, &hostname, tls)).await {
@@ -293,15 +401,15 @@ pub async fn run(args: Args) -> Result<(), String> {
         let turn = tokio::select! {
             _ = term.recv() => break,
             _ = int.recv() => break,
-            Some((u, name)) = rx.recv() => {
-                let now = clock.mono_ms();
-                if let Some(class) = policy.decide(&u.path, &u.value, now)
+            Some((u, name, at)) = rx.recv() => {
+                if let Some(class) = policy.decide(&u.path, &u.value, at)
                     && let Some(value) = to_value(&u.path, &u.value)
                 {
                     let def = defines.get(&u.path, name, value.value_type()).clone();
-                    dev.sample(class, &def, now, value);
+                    dev.sample(class, &def, at, value);
                 }
-                Turn::Poll
+                // A sample never makes a frame sendable; the tick polls.
+                Turn::Skip
             }
             _ = tick.tick() => {
                 sealed.clear();
@@ -330,23 +438,19 @@ pub async fn run(args: Args) -> Result<(), String> {
             r = async { connecting.as_mut().unwrap().await }, if connecting.is_some() => {
                 connecting = None;
                 match r {
-                    Ok((mut socket, binding)) => match dev.connect(binding, clock.mono_ms()) {
+                    Ok((socket, binding)) => match dev.connect(binding, clock.mono_ms()) {
                         Some(hello) => {
-                            if socket.send(Message::Binary(hello.encode_to_vec().into())).await.is_ok() {
-                                ws = Some(socket);
-                                welcomed = false;
-                                Turn::Poll
+                            let l = Link::new(socket);
+                            if let Err(e) = l.queue(vec![hello]) {
+                                l.abort();
+                                lose(&mut link, &mut dev, &mut retry, e);
                             } else {
-                                eprintln!("gateway {addr}: sending the Hello failed");
-                                dev.disconnect();
-                                retry.failed();
-                                Turn::Skip
+                                link = Some(l);
+                                welcomed = false;
                             }
+                            Turn::Skip
                         }
-                        None => {
-                            let _ = tokio::time::timeout(Duration::from_secs(1), socket.close(None)).await;
-                            Turn::Fatal("the log could not be read to say Hello".into())
-                        }
+                        None => Turn::Fatal("the log could not be read to say Hello".into()),
                     },
                     Err(e) => {
                         eprintln!("gateway {addr}: {e}");
@@ -355,23 +459,24 @@ pub async fn run(args: Args) -> Result<(), String> {
                     }
                 }
             }
-            msg = async { ws.as_mut().unwrap().next().await }, if ws.is_some() => {
-                let env = match msg {
-                    Some(Ok(Message::Binary(b))) => Some(Envelope::decode(b.as_ref()).ok()),
-                    Some(Ok(Message::Close(f))) => { eprintln!("gateway closed: {f:?}"); Some(None) }
+            ev = async { link.as_mut().unwrap().next().await }, if link.is_some() => {
+                let env = match ev {
+                    LinkEvent::Msg(Some(Ok(Message::Binary(b)))) => Ok(Envelope::decode(b.as_ref()).ok()),
+                    LinkEvent::Msg(Some(Ok(Message::Close(f)))) => Err(format!("gateway closed: {f:?}")),
                     // Text, Ping, Pong: tungstenite answers pings itself.
-                    Some(Ok(_)) => None,
-                    Some(Err(e)) => { eprintln!("gateway: {e}"); Some(None) }
-                    None => { eprintln!("gateway: connection ended"); Some(None) }
+                    LinkEvent::Msg(Some(Ok(_))) => Ok(None),
+                    LinkEvent::Msg(Some(Err(e))) => Err(format!("gateway: {e}")),
+                    LinkEvent::Msg(None) => Err("gateway: connection ended".into()),
+                    LinkEvent::WriterEnded(e) => Err(format!("gateway: {e}")),
+                    LinkEvent::Silent => Err(format!("gateway: nothing heard for {GATEWAY_IDLE:?}")),
                 };
                 match env {
-                    None => Turn::Skip,
-                    Some(None) => {
-                        drop_ws(&mut ws, &mut dev).await;
-                        retry.failed();
+                    Ok(None) => Turn::Skip,
+                    Err(e) => {
+                        lose(&mut link, &mut dev, &mut retry, &e);
                         Turn::Skip
                     }
-                    Some(Some(env)) => {
+                    Ok(Some(env)) => {
                         let is_welcome = matches!(env.body, Some(Body::Welcome(_)));
                         match dev.receive(env, clock.mono_ms()) {
                             Ok(out) => {
@@ -380,10 +485,8 @@ pub async fn run(args: Args) -> Result<(), String> {
                                     retry.welcomed();
                                     eprintln!("Welcome received: device {:?}", dev.state());
                                 }
-                                if send_all(ws.as_mut().unwrap(), out).await.is_err() {
-                                    eprintln!("gateway: sending failed");
-                                    drop_ws(&mut ws, &mut dev).await;
-                                    retry.failed();
+                                if let Err(e) = link.as_ref().unwrap().queue(out) {
+                                    lose(&mut link, &mut dev, &mut retry, e);
                                     Turn::Skip
                                 } else {
                                     Turn::Poll
@@ -391,9 +494,7 @@ pub async fn run(args: Args) -> Result<(), String> {
                             }
                             Err(SessionError::Storage(e)) => Turn::Fatal(format!("the log failed in the session: {e:?}")),
                             Err(e) => {
-                                eprintln!("session ended: {e:?}");
-                                drop_ws(&mut ws, &mut dev).await;
-                                retry.failed();
+                                lose(&mut link, &mut dev, &mut retry, &format!("session ended: {e:?}"));
                                 Turn::Skip
                             }
                         }
@@ -405,16 +506,14 @@ pub async fn run(args: Args) -> Result<(), String> {
             Turn::Fatal(e) => Some(e),
             Turn::Skip => None,
             // Whatever the session may send now: batches the credit allows, reports, a Fetch.
-            Turn::Poll => match ws.as_mut() {
-                Some(socket) if dev.connected() => {
+            Turn::Poll => match link.as_ref() {
+                Some(l) if dev.connected() => {
                     let out = dev.poll();
                     if let Some(e) = dev.take_storage_fault() {
                         Some(format!("reading the log failed: {e:?}"))
                     } else {
-                        if send_all(socket, out).await.is_err() {
-                            eprintln!("gateway: sending failed");
-                            drop_ws(&mut ws, &mut dev).await;
-                            retry.failed();
+                        if let Err(e) = l.queue(out) {
+                            lose(&mut link, &mut dev, &mut retry, e);
                         }
                         None
                     }
@@ -424,7 +523,10 @@ pub async fn run(args: Args) -> Result<(), String> {
         };
         if let Some(e) = fault {
             eprintln!("{e}; ending this boot so the next one recovers the log");
-            drop_ws(&mut ws, &mut dev).await;
+            if let Some(l) = link.take() {
+                l.abort();
+            }
+            dev.disconnect();
             return Err(e);
         }
     }
@@ -444,7 +546,10 @@ pub async fn run(args: Args) -> Result<(), String> {
     sealed.clear();
     if let Err(e) = dev.flush(clock.mono_ms(), &mut sealed) {
         eprintln!("sealing at stop failed: {e:?}");
-        drop_ws(&mut ws, &mut dev).await;
+        if let Some(l) = link.take() {
+            l.abort();
+        }
+        dev.disconnect();
         return Err(format!("sealing at stop failed: {e:?}"));
     }
     eprintln!(
@@ -454,15 +559,13 @@ pub async fn run(args: Args) -> Result<(), String> {
         dev.log().next_seq(Class::P2)
     );
     let mut fault = None;
-    if let Some(socket) = ws.as_mut()
-        && dev.connected()
-    {
-        let out = dev.poll();
-        fault = dev.take_storage_fault();
-        let _ = tokio::time::timeout_at(deadline, send_all(socket, out)).await;
-    }
-    if let Some(mut socket) = ws.take() {
-        let _ = tokio::time::timeout_at(deadline, socket.close(None)).await;
+    if let Some(l) = link.take() {
+        if dev.connected() {
+            let out = dev.poll();
+            fault = dev.take_storage_fault();
+            let _ = l.queue(out);
+        }
+        l.finish(deadline).await;
     }
     dev.disconnect();
     if let Some(e) = fault {
@@ -473,20 +576,17 @@ pub async fn run(args: Args) -> Result<(), String> {
     Ok(())
 }
 
-async fn send_all(ws: &mut Ws, out: Vec<Envelope>) -> Result<(), ()> {
-    for env in out {
-        ws.send(Message::Binary(env.encode_to_vec().into()))
-            .await
-            .map_err(|_| ())?;
-    }
-    Ok(())
-}
+type Tls = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
 
-async fn drop_ws(ws: &mut Option<Ws>, dev: &mut Device<FileStore, AgentSink>) {
-    if let Some(mut s) = ws.take() {
-        let _ = tokio::time::timeout(Duration::from_secs(1), s.close(None)).await;
+/// The session is lost: drop the connection at once, tell the device (which rewinds to its
+/// upload cursor on the next Hello), and wait the backoff.
+fn lose(link: &mut Option<Link<Tls>>, dev: &mut Device<FileStore, AgentSink>, retry: &mut Retry, why: &str) {
+    eprintln!("{why}");
+    if let Some(l) = link.take() {
+        l.abort();
     }
     dev.disconnect();
+    retry.failed();
 }
 
 #[cfg(test)]
@@ -500,7 +600,80 @@ mod tests {
         assert_eq!(jittered(d, 1000), d);
         assert_eq!(jittered(d, 500), Duration::from_secs(9));
         assert!(jittered(d, 999) < d + d / 4);
-        assert!(jittered(d, u32::MAX) <= d + d / 4);
+        assert!(jittered(d, u64::MAX) <= d + d / 4);
+        // Not stuck at one value, as a clock with microsecond resolution would make it.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..50 {
+            seen.insert(jitter(d));
+        }
+        assert!(seen.len() > 10, "{seen:?}");
+    }
+
+    /// A client `Link` and the gateway's end of an in-memory WebSocket with `buf` bytes of
+    /// buffer each way.
+    async fn pair(buf: usize) -> (Link<tokio::io::DuplexStream>, WebSocketStream<tokio::io::DuplexStream>) {
+        let (a, b) = tokio::io::duplex(buf);
+        let (client, server) = tokio::join!(
+            tokio_tungstenite::client_async("ws://ingest.sim/", a),
+            tokio_tungstenite::accept_async(b)
+        );
+        (Link::new(client.unwrap().0), server.unwrap())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_gateway_is_dropped_after_its_idle_timeout() {
+        let (mut link, mut gw) = pair(4096).await;
+        let start = Instant::now();
+        gw.send(Message::Binary(vec![1].into())).await.unwrap();
+        assert!(matches!(
+            link.next().await,
+            LinkEvent::Msg(Some(Ok(Message::Binary(_))))
+        ));
+        // Heard at start + 30 s; silent from then on.
+        tokio::time::advance(Duration::from_secs(30)).await;
+        gw.send(Message::Ping(vec![].into())).await.unwrap();
+        assert!(matches!(link.next().await, LinkEvent::Msg(Some(Ok(Message::Ping(_))))));
+        assert!(matches!(link.next().await, LinkEvent::Silent));
+        assert_eq!(Instant::now() - start, Duration::from_secs(30) + GATEWAY_IDLE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_uplink_never_waits_the_caller_and_ends_the_writer() {
+        // The gateway never reads; it keeps talking, so the link is not silent.
+        let (mut link, mut gw) = pair(256).await;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                if gw.send(Message::Text("still here".into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let env = Envelope { body: None };
+        // Queueing returns at once while the writer is stuck, then reports the queue full.
+        let start = Instant::now();
+        let mut full = false;
+        for _ in 0..2 * OUT_QUEUE {
+            if link.queue(vec![env.clone(); 1]).is_err() {
+                full = true;
+                break;
+            }
+        }
+        assert!(full, "the queue never filled");
+        assert_eq!(Instant::now(), start);
+        let ended = loop {
+            match link.next().await {
+                LinkEvent::Msg(Some(Ok(_))) => continue,
+                other => break other,
+            }
+        };
+        match ended {
+            LinkEvent::WriterEnded(e) => assert!(e.contains("waited"), "{e}"),
+            LinkEvent::Silent => panic!("silent"),
+            LinkEvent::Msg(m) => panic!("{m:?}"),
+        }
+        assert!(Instant::now() - start >= GATEWAY_IDLE);
+        assert!(link.queue(vec![env]).is_err());
     }
 
     #[test]

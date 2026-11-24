@@ -5,6 +5,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use sl_core::session::anchor_quality;
 use sl_proto::record::{AnchorSource, TimeAnchor};
 
+#[derive(Clone, Copy)]
 pub struct Clock {
     zero: Instant,
 }
