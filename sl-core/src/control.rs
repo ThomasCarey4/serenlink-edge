@@ -128,13 +128,15 @@ impl Control {
         self.judge();
     }
 
-    /// A newer trust store this offer holds, that verifies and has not failed this session:
-    /// it may carry the key that signs the rest (amended in the final review).
+    /// A newer trust store this offer holds, that verifies, has not failed this session and
+    /// was not withdrawn (an empty `Chunk`): it may carry the key that signs the rest (amended
+    /// in the final review).
     fn pending_trust(&self, offer: &Offer, trust: &TrustStore) -> bool {
         offer.manifests.iter().any(|m| {
             m.kind == ArtifactKind::Trust as u32
                 && m.version > trust.version
                 && !self.failed.contains(&(ArtifactKind::Trust, m.version))
+                && !self.gone.contains(&(ArtifactKind::Trust, m.version))
                 && verify_manifest(m, trust, &self.device_id).is_ok()
         })
     }
@@ -189,12 +191,21 @@ impl Control {
                 *slot = Some(m.clone());
             }
         }
-        // A deferred apply is believed only while the store still verifies it.
+        // A deferred apply is believed only while the store still verifies it. Dropping one is
+        // always reported, past `MAX_REFUSED` too: the shell held it, and the server must
+        // learn it will not run. The cap bounds what is remembered, not this.
         let mut kept = Vec::new();
         for d in core::mem::take(&mut self.deferred) {
             match verify_manifest(&d, &trust, &self.device_id) {
                 Ok(_) => kept.push(d),
-                Err(e) => self.refuse(d.kind, d.version, e.reason()),
+                Err(e) if !self.refused.contains(&(d.kind, d.version)) => {
+                    if self.refused.len() < MAX_REFUSED {
+                        self.refused.insert((d.kind, d.version));
+                    }
+                    self.reports
+                        .push(report(d.kind, d.version, Outcome::Refused, e.reason()));
+                }
+                Err(_) => {}
             }
         }
         self.deferred = kept;
@@ -332,6 +343,10 @@ impl Control {
         if chunk.bytes.is_empty() {
             self.gone.insert((kind, version));
             self.drop_download();
+            // A withdrawn trust store no longer holds back the refusals that waited on it.
+            if kind == ArtifactKind::Trust {
+                self.rejudge(None);
+            }
             return Event::None;
         }
         let len = chunk.bytes.len() as u64;

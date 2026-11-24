@@ -709,6 +709,88 @@ fn a_download_paused_for_a_trust_store_resumes_after_it() {
 }
 
 #[test]
+fn a_fetch_in_flight_when_a_trust_store_is_offered_is_swallowed_then_resumed() {
+    let mut r = Rig::new();
+    let t = r.release(Tables, 2, body(40 * 1024, 9));
+    r.offer(vec![t.clone()]);
+    let f = fetches(&r.poll()).remove(0);
+    assert_eq!((f.kind, f.offset), (Tables as u32, 0));
+    let s = store_with(&mut r, 2, &[1, 2]);
+    r.offer(vec![t, s]);
+    // The tables' Fetch is still unanswered: nothing more is sent until it is.
+    assert!(r.poll().is_empty());
+    let c = r.answer(&f);
+    assert_eq!(r.chunk(c), Event::None);
+    assert_eq!(r.sink.progress(Tables), Some((2, 0)), "the answer was not written");
+    let out = r.pump();
+    let order: Vec<(u32, u64)> = fetches(&out).iter().map(|f| (f.kind, f.offset)).collect();
+    assert_eq!(
+        order,
+        vec![
+            (Trust as u32, 0),
+            (Tables as u32, 0),
+            (Tables as u32, 16384),
+            (Tables as u32, 32768)
+        ]
+    );
+    assert_eq!(
+        reports(&out),
+        vec![
+            rep(Trust, 2, Outcome::Applied, Reason::None),
+            rep(Tables, 2, Outcome::Applied, Reason::None),
+        ]
+    );
+}
+
+#[test]
+fn a_withdrawn_trust_store_frees_the_refusals_it_held() {
+    let mut r = Rig::new();
+    let (t, _) = tables_by_key_2(&mut r, 2);
+    let s = store_with(&mut r, 2, &[1, 2]);
+    r.offer(vec![t, s]);
+    let out = r.poll();
+    assert!(reports(&out).is_empty());
+    let f = fetches(&out).remove(0);
+    assert_eq!(f.kind, Trust as u32);
+    r.chunk(Chunk {
+        kind: f.kind,
+        version: f.version,
+        offset: f.offset,
+        bytes: vec![],
+    });
+    let out = r.poll();
+    assert_eq!(reports(&out), vec![rep(Tables, 2, Outcome::Refused, Reason::Signature)]);
+    assert!(fetches(&out).is_empty());
+}
+
+#[test]
+fn a_deferred_apply_dropped_by_a_new_store_is_reported_past_the_cap() {
+    let mut r = Rig::new();
+    r.sink.set_defer(true);
+    let fw = r.release(Firmware, 2, body(100, 2));
+    r.offer(vec![fw.clone()]);
+    assert!(reports(&r.pump()).is_empty());
+    // Fill the refusals remembered, with forgeries no store will ever verify.
+    let rogue = [0x99u8; 32];
+    let forged: Vec<Manifest> = (0..MAX_REFUSED as u32)
+        .map(|v| Manifest::sign_release(Tables, v + 2, &body(10, 0), 1, &rogue))
+        .collect();
+    r.offer(forged);
+    assert_eq!(reports(&r.pump()).len(), MAX_REFUSED);
+    let s = store_with(&mut r, 2, &[2]);
+    r.offer(vec![fw, s]);
+    let out = r.pump();
+    assert_eq!(
+        reports(&out),
+        vec![
+            rep(Trust, 2, Outcome::Applied, Reason::None),
+            rep(Firmware, 2, Outcome::Refused, Reason::Signature),
+        ]
+    );
+    assert!(!r.control.is_deferred(Firmware, 2));
+}
+
+#[test]
 fn a_manifest_of_an_unknown_kind_is_skipped_without_a_report() {
     let mut r = Rig::new();
     let mut m = r.release(Tables, 2, body(100, 0));
