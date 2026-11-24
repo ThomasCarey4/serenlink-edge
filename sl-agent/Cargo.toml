@@ -1,0 +1,27 @@
+[package]
+name = "sl-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "SerenLink agent: records a SignalK server's data into the durable log and uploads it"
+license = "Apache-2.0"
+
+[dependencies]
+sl-proto = { workspace = true, features = ["std", "zstd"] }
+sl-core = { path = "../sl-core", features = ["std", "zstd"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+hex = "0.4"
+libc = "0.2"
+prost = "0.13"
+regex = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "net", "time", "macros", "signal", "sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
+tokio-tungstenite = { version = "0.27", default-features = false, features = ["handshake", "connect"] }
+ureq = { version = "2", default-features = false, features = ["json"] }
+
+[dev-dependencies]
+tempfile = "3"

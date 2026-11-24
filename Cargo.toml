@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["sl-proto", "sl-core"]
+members = ["sl-proto", "sl-core", "sl-agent"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,3 +9,6 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 sl-proto = { path = "sl-proto", default-features = false }
+
+[profile.release]
+panic = "abort"
