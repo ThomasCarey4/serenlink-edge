@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use sl_core::control::{Control, Event};
+use sl_core::control::{Control, Event, MAX_REFUSED};
 use sl_core::mem_sink::MemSink;
 use sl_core::mem_storage::MemStorage;
 use sl_core::sink::ArtifactSink;
@@ -273,6 +273,30 @@ fn a_complete_partial_resumes_at_its_last_byte() {
 }
 
 #[test]
+fn a_complete_partial_deferred_before_a_reboot_is_deferred_again() {
+    // The sink kept a whole, verified body across a reboot, but `deferred` was RAM: a fresh
+    // `Control` fetches its last byte, checks it, and the sink defers it once more.
+    let mut r = Rig::new();
+    r.sink.set_defer(true);
+    let b = body(1000, 4);
+    let t = r.release(Tables, 2, b.clone());
+    r.sink.begin(&t).unwrap();
+    r.sink.write(Tables, 0, &b).unwrap();
+    r.offer(vec![t.clone()]);
+    let out = r.pump();
+    let offsets: Vec<u64> = fetches(&out).iter().map(|f| f.offset).collect();
+    assert_eq!(offsets, vec![999]);
+    assert!(reports(&out).is_empty());
+    assert!(r.control.is_deferred(Tables, 2));
+    assert!(r.sink.applied().is_empty());
+
+    assert!(r.sink.apply_now(&t));
+    assert!(r.control.finish(Tables, 2, Outcome::Applied, Reason::None));
+    assert_eq!(reports(&r.poll()), vec![rep(Tables, 2, Outcome::Applied, Reason::None)]);
+    assert_eq!(r.sink.applied(), &[(t, b)]);
+}
+
+#[test]
 fn a_misplaced_or_overlong_chunk_is_dropped_and_fetched_again() {
     let mut r = Rig::new();
     let t = r.release(Tables, 2, body(40 * 1024, 9));
@@ -518,12 +542,194 @@ fn a_trust_store_is_applied_through_the_anchor() {
 #[test]
 fn a_trust_store_the_anchor_refuses_is_reported() {
     let mut r = Rig::new();
-    // The manifest is newer than the active store; the store inside is not.
-    let t = r.release(Trust, 2, signed_store(&store(1)));
+    // The manifest verifies; the store inside is signed by a key the active store lacks.
+    let t = r.release(Trust, 2, SignedTrustStore::sign(&store(2), 1, &OTHER).to_bytes());
     r.offer(vec![t]);
     let out = r.pump();
-    assert_eq!(reports(&out), vec![rep(Trust, 2, Outcome::Refused, Reason::NotNewer)]);
+    assert_eq!(reports(&out), vec![rep(Trust, 2, Outcome::Refused, Reason::Signature)]);
     assert_eq!(r.anchor.active().version, 1);
+}
+
+#[test]
+fn a_trust_store_of_another_version_than_its_manifest_is_refused() {
+    for inner in [1, 3] {
+        let mut r = Rig::new();
+        let t = r.release(Trust, 2, signed_store(&store(inner)));
+        r.offer(vec![t]);
+        let out = r.pump();
+        assert_eq!(
+            reports(&out),
+            vec![rep(Trust, 2, Outcome::Refused, Reason::Signature)],
+            "store {inner} in manifest 2"
+        );
+        assert_eq!(r.anchor.active().version, 1);
+    }
+}
+
+/// Store `version` holding the keys `keys` (1: `RELEASE`, 2: `OTHER`), signed by key 1.
+fn store_with(r: &mut Rig, version: u32, keys: &[u32]) -> Manifest {
+    let mut s = store(version);
+    s.release_keys = keys
+        .iter()
+        .map(|id| ReleaseKey {
+            id: *id,
+            pubkey: public(if *id == 1 { &RELEASE } else { &OTHER }),
+        })
+        .collect();
+    r.release(Trust, version, signed_store(&s))
+}
+
+/// Tables `version`, signed by key 2 (`OTHER`), which the factory store lacks.
+fn tables_by_key_2(r: &mut Rig, version: u32) -> (Manifest, Vec<u8>) {
+    let b = body(100, 5);
+    let m = Manifest::sign_release(Tables, version, &b, 2, &OTHER);
+    r.bodies.insert((Tables as u32, version), b.clone());
+    (m, b)
+}
+
+#[test]
+fn a_trust_store_and_what_its_new_key_signs_land_in_one_session() {
+    let mut r = Rig::new();
+    let (t, b) = tables_by_key_2(&mut r, 2);
+    let s = store_with(&mut r, 2, &[1, 2]);
+    // The tables come first in the Offer: the store is fetched first regardless.
+    r.offer(vec![t.clone(), s]);
+    let out = r.pump();
+    assert_eq!(
+        reports(&out),
+        vec![
+            rep(Trust, 2, Outcome::Applied, Reason::None),
+            rep(Tables, 2, Outcome::Applied, Reason::None),
+        ]
+    );
+    assert_eq!(r.anchor.active().version, 2);
+    assert_eq!(r.sink.applied(), &[(t, b)]);
+}
+
+#[test]
+fn refusals_held_for_a_trust_store_are_reported_once_it_fails() {
+    // Refused by the anchor, garbled, or lost to the sink: in each case what waited on the
+    // store is judged without it, and refused.
+    for case in 0..3 {
+        let mut r = Rig::new();
+        let (t, _) = tables_by_key_2(&mut r, 2);
+        let s = match case {
+            0 => r.release(Trust, 2, SignedTrustStore::sign(&store(2), 1, &OTHER).to_bytes()),
+            1 => r.release(Trust, 2, vec![1, 2, 3]),
+            _ => store_with(&mut r, 2, &[1, 2]),
+        };
+        r.offer(vec![t, s]);
+        if case == 2 {
+            r.sink.fail_next_write();
+        }
+        let out = r.pump();
+        let trust_outcome = match case {
+            2 => rep(Trust, 2, Outcome::Failed, Reason::Storage),
+            _ => rep(Trust, 2, Outcome::Refused, Reason::Signature),
+        };
+        assert_eq!(
+            reports(&out),
+            vec![trust_outcome, rep(Tables, 2, Outcome::Refused, Reason::Signature)],
+            "case {case}"
+        );
+        assert!(fetches(&out).iter().all(|f| f.kind == Trust as u32), "case {case}");
+        assert!(r.sink.applied().is_empty());
+    }
+}
+
+#[test]
+fn a_store_that_revokes_a_signer_drops_its_download_and_its_deferred_apply() {
+    // A download under way when the store is offered yields to it, and is not resumed once
+    // the store drops the key that signed it.
+    let mut r = Rig::new();
+    let t = r.release(Tables, 2, body(40 * 1024, 9));
+    r.offer(vec![t.clone()]);
+    let f = fetches(&r.poll()).remove(0);
+    let c = r.answer(&f);
+    r.chunk(c);
+    let s = store_with(&mut r, 2, &[2]);
+    r.offer(vec![t.clone(), s]);
+    let out = r.pump();
+    assert!(fetches(&out).iter().all(|f| f.kind == Trust as u32));
+    assert_eq!(
+        reports(&out),
+        vec![
+            rep(Trust, 2, Outcome::Applied, Reason::None),
+            rep(Tables, 2, Outcome::Refused, Reason::Signature),
+        ]
+    );
+    assert!(r.sink.applied().is_empty());
+
+    // A deferred apply is discarded, so the shell's `finish` makes nothing active.
+    let mut r = Rig::new();
+    r.sink.set_defer(true);
+    let t = r.release(Firmware, 2, body(100, 2));
+    r.offer(vec![t.clone()]);
+    assert!(reports(&r.pump()).is_empty());
+    assert!(r.control.is_deferred(Firmware, 2));
+    let s = store_with(&mut r, 2, &[2]);
+    r.offer(vec![t, s]);
+    let out = r.pump();
+    assert_eq!(
+        reports(&out),
+        vec![
+            rep(Trust, 2, Outcome::Applied, Reason::None),
+            rep(Firmware, 2, Outcome::Refused, Reason::Signature),
+        ]
+    );
+    assert!(!r.control.is_deferred(Firmware, 2));
+    assert!(!r.control.finish(Firmware, 2, Outcome::Applied, Reason::None));
+    assert_eq!(r.control.running(Firmware, r.anchor.active()), 1);
+    assert!(r.poll().is_empty());
+}
+
+#[test]
+fn a_download_paused_for_a_trust_store_resumes_after_it() {
+    let mut r = Rig::new();
+    let t = r.release(Tables, 2, body(40 * 1024, 9));
+    r.offer(vec![t.clone()]);
+    let f = fetches(&r.poll()).remove(0);
+    let c = r.answer(&f);
+    r.chunk(c);
+    let s = store_with(&mut r, 2, &[1, 2]);
+    r.offer(vec![t, s]);
+    let out = r.pump();
+    let order: Vec<(u32, u64)> = fetches(&out).iter().map(|f| (f.kind, f.offset)).collect();
+    assert_eq!(
+        order,
+        vec![(Trust as u32, 0), (Tables as u32, 16384), (Tables as u32, 32768)]
+    );
+    assert_eq!(
+        reports(&out),
+        vec![
+            rep(Trust, 2, Outcome::Applied, Reason::None),
+            rep(Tables, 2, Outcome::Applied, Reason::None),
+        ]
+    );
+}
+
+#[test]
+fn a_manifest_of_an_unknown_kind_is_skipped_without_a_report() {
+    let mut r = Rig::new();
+    let mut m = r.release(Tables, 2, body(100, 0));
+    m.kind = 9;
+    r.offer(vec![m]);
+    assert!(r.pump().is_empty());
+}
+
+#[test]
+fn refusals_remembered_are_capped() {
+    let mut r = Rig::new();
+    let forged: Vec<Manifest> = (0..MAX_REFUSED as u32 + 8)
+        .map(|v| Manifest::sign_release(Tables, v + 2, &body(10, 0), 1, &OTHER))
+        .collect();
+    r.offer(forged.clone());
+    let out = r.pump();
+    assert_eq!(reports(&out).len(), MAX_REFUSED);
+    assert!(fetches(&out).is_empty());
+    // Past the cap, nothing more is reported, and nothing is fetched.
+    r.offer(forged);
+    assert!(r.pump().is_empty());
 }
 
 #[test]
@@ -560,7 +766,7 @@ fn a_deferred_apply_reports_on_finish() {
 #[test]
 fn finish_ignores_what_is_not_deferred() {
     let mut r = Rig::new();
-    r.control.finish(Tables, 9, Outcome::Applied, Reason::None);
+    assert!(!r.control.finish(Tables, 9, Outcome::Applied, Reason::None));
     assert!(r.poll().is_empty());
     assert_eq!(r.control.running(Tables, r.anchor.active()), 1);
 }
@@ -573,8 +779,11 @@ fn a_deferred_apply_survives_a_disconnect() {
     r.offer(vec![t.clone()]);
     r.pump();
     r.control.on_disconnected();
+    // Offered again while still deferred: the deferral, not the version, keeps it unfetched.
+    r.offer(vec![t.clone()]);
+    assert!(r.poll().is_empty());
     r.sink.apply_now(&t);
-    r.control.finish(Tables, 2, Outcome::Applied, Reason::None);
+    assert!(r.control.finish(Tables, 2, Outcome::Applied, Reason::None));
     r.control.on_disconnected();
     r.offer(vec![t]);
     let out = r.poll();
@@ -628,6 +837,25 @@ fn report_applied_covers_what_finish_cannot() {
     let f = r.release(Firmware, 5, body(100, 4));
     r.offer(vec![f]);
     assert!(r.poll().is_empty());
+}
+
+#[test]
+fn report_failed_covers_what_finish_cannot() {
+    let mut r = Rig::new();
+    r.control.report_failed(Firmware, 5, Reason::Apply);
+    assert_eq!(r.control.running(Firmware, r.anchor.active()), 1);
+    assert_eq!(
+        reports(&r.poll()),
+        vec![rep(Firmware, 5, Outcome::Failed, Reason::Apply)]
+    );
+    // Failed for this session: offered, it is not fetched.
+    let f = r.release(Firmware, 5, body(100, 4));
+    r.offer(vec![f.clone()]);
+    assert!(r.poll().is_empty());
+    // The next session tries it again.
+    r.control.on_disconnected();
+    r.offer(vec![f]);
+    assert_eq!(fetches(&r.poll()).len(), 1);
 }
 
 #[test]

@@ -26,6 +26,11 @@ pub enum Event {
     Applied(ArtifactKind, u32),
 }
 
+/// The most (kind, version) refusals remembered in a session. Past it a refusal is neither
+/// reported nor remembered, though the manifest is still not fetched: a byzantine server can
+/// offer endlessly many bad manifests, and the device's memory must not grow with them.
+pub const MAX_REFUSED: usize = 32;
+
 /// The download under way: one at a time, across all kinds.
 struct Download {
     m: Manifest,
@@ -40,6 +45,10 @@ pub struct Control {
     device_id: [u8; 16],
     /// By `ArtifactKind::index`; Trust's entry is unused (the trust store knows its version).
     running: [u32; 4],
+    /// The last `Offer` as it arrived, and the trust store it was last judged against: judged
+    /// again when the store changes, or when a trust store it holds fails.
+    offer: Option<Offer>,
+    store: Option<TrustStore>,
     /// The current offer, by kind, with every manifest already verified.
     offered: [Option<Manifest>; 4],
     current: Option<Download>,
@@ -47,7 +56,8 @@ pub struct Control {
     /// the server allows one `Fetch` outstanding, so nothing is fetched until its `Chunk`
     /// arrives, even when that `Chunk` is no longer wanted.
     in_flight: Option<(u32, u32)>,
-    /// (kind, version) already reported refused this session, so each is reported once.
+    /// (kind, version) already reported refused this session, so each is reported once; at
+    /// most `MAX_REFUSED` of them.
     refused: BTreeSet<(u32, u32)>,
     /// Failed this session: not fetched again until the next one.
     failed: BTreeSet<(ArtifactKind, u32)>,
@@ -75,6 +85,8 @@ impl Control {
         Self {
             device_id,
             running,
+            offer: None,
+            store: None,
             offered: Default::default(),
             current: None,
             in_flight: None,
@@ -96,6 +108,8 @@ impl Control {
     /// The session ended. The sink keeps its partial, so the next session resumes it; what was
     /// refused or failed is tried afresh, and queued reports wait for the next `poll`.
     pub fn on_disconnected(&mut self) {
+        self.offer = None;
+        self.store = None;
         self.offered = Default::default();
         self.current = None;
         self.in_flight = None;
@@ -109,18 +123,55 @@ impl Control {
     /// offering the same bad manifest hears about it once.
     pub fn on_offer(&mut self, offer: Offer, trust: &TrustStore) {
         self.gone.clear();
+        self.offer = Some(offer);
+        self.store = Some(trust.clone());
+        self.judge();
+    }
+
+    /// A newer trust store this offer holds, that verifies and has not failed this session:
+    /// it may carry the key that signs the rest (amended in the final review).
+    fn pending_trust(&self, offer: &Offer, trust: &TrustStore) -> bool {
+        offer.manifests.iter().any(|m| {
+            m.kind == ArtifactKind::Trust as u32
+                && m.version > trust.version
+                && !self.failed.contains(&(ArtifactKind::Trust, m.version))
+                && verify_manifest(m, trust, &self.device_id).is_ok()
+        })
+    }
+
+    /// Judge the kept offer against the kept store. While it holds a pending trust store, a
+    /// manifest of another kind whose signature does not verify is neither refused nor
+    /// fetched: it is judged again once that store is applied, refused or failed. A manifest
+    /// of a kind this device does not know is skipped without a report, for a newer server's
+    /// sake. Deferred applies the store no longer verifies are dropped and refused.
+    fn judge(&mut self) {
+        let (Some(offer), Some(trust)) = (self.offer.take(), self.store.take()) else {
+            return;
+        };
+        let pending = self.pending_trust(&offer, &trust);
         let mut offered: [Option<Manifest>; 4] = Default::default();
-        for m in offer.manifests {
-            let kind = match verify_manifest(&m, trust, &self.device_id) {
+        for m in &offer.manifests {
+            // An unknown kind is skipped, and so is the version the device runs, before its
+            // signature: the store may since have dropped the key that signed it, and nothing
+            // is fetched either way.
+            let Some(known) = ArtifactKind::from_u32(m.kind) else {
+                continue;
+            };
+            if m.version == self.running(known, &trust) {
+                continue;
+            }
+            let kind = match verify_manifest(m, &trust, &self.device_id) {
                 Ok(kind) => kind,
                 Err(e) => {
-                    self.refuse(m.kind, m.version, e.reason());
+                    let held_back = pending && e.reason() == Reason::Signature && m.kind != ArtifactKind::Trust as u32;
+                    if !held_back {
+                        self.refuse(m.kind, m.version, e.reason());
+                    }
                     continue;
                 }
             };
-            let running = self.running(kind, trust);
-            if m.version == running
-                || self.failed.contains(&(kind, m.version))
+            let running = self.running(kind, &trust);
+            if self.failed.contains(&(kind, m.version))
                 || self
                     .deferred
                     .iter()
@@ -135,30 +186,60 @@ impl Control {
             // Two of one kind in one offer: the newer is the one worth having.
             let slot = &mut offered[kind.index()];
             if slot.as_ref().is_none_or(|held| held.version < m.version) {
-                *slot = Some(m);
+                *slot = Some(m.clone());
             }
         }
+        // A deferred apply is believed only while the store still verifies it.
+        let mut kept = Vec::new();
+        for d in core::mem::take(&mut self.deferred) {
+            match verify_manifest(&d, &trust, &self.device_id) {
+                Ok(_) => kept.push(d),
+                Err(e) => self.refuse(d.kind, d.version, e.reason()),
+            }
+        }
+        self.deferred = kept;
         self.offered = offered;
         if let Some(d) = &self.current
             // The whole manifest, not just (kind, version): one re-signed at the same version
             // restarts the download, as the sink's partial may be of different bytes.
-            && self.offered[d.kind.index()].as_ref() != Some(&d.m)
+            && (self.offered[d.kind.index()].as_ref() != Some(&d.m)
+                // A pending trust store goes first, so what it revokes is never applied; the
+                // sink keeps the partial, and the download resumes from it afterwards.
+                || (pending && d.kind != ArtifactKind::Trust))
         {
             // Withdrawn: its Fetch stays in flight, and the Chunk answering it is ignored,
             // being no longer current.
             self.drop_download();
         }
+        self.offer = Some(offer);
+        self.store = Some(trust);
+    }
+
+    /// The trust store changed or a trust download ended without one: judge the kept offer
+    /// again, against `trust`.
+    fn rejudge(&mut self, trust: Option<&TrustStore>) {
+        if let Some(trust) = trust {
+            self.store = Some(trust.clone());
+        }
+        self.judge();
     }
 
     fn refuse(&mut self, kind: u32, version: u32, reason: Reason) {
-        if self.refused.insert((kind, version)) {
-            self.reports.push(report(kind, version, Outcome::Refused, reason));
+        if self.refused.len() >= MAX_REFUSED || self.refused.contains(&(kind, version)) {
+            return;
         }
+        self.refused.insert((kind, version));
+        self.reports.push(report(kind, version, Outcome::Refused, reason));
     }
 
+    /// Queue a `Failed` report and stop fetching (kind, version) this session. A trust store
+    /// that fails frees what waited on it.
     fn fail(&mut self, kind: ArtifactKind, version: u32, reason: Reason) {
         self.failed.insert((kind, version));
         self.reports.push(report(kind as u32, version, Outcome::Failed, reason));
+        if kind == ArtifactKind::Trust {
+            self.rejudge(None);
+        }
     }
 
     /// End the current download; the `failed` and `gone` sets, or the offer, say whether it
@@ -300,16 +381,17 @@ impl Control {
     }
 
     /// The shell's word on a deferred apply of (`kind`, `version`): `Applied` once it is
-    /// running, or `Failed`. Anything that is not a deferred apply is ignored. The report waits
-    /// for the next `poll`, which may be in a later session. No `Event` comes back: after an
-    /// `Applied` the shell must also call `Session::set_running`.
-    pub fn finish(&mut self, kind: ArtifactKind, version: u32, outcome: Outcome, reason: Reason) {
+    /// running, or `Failed`. Anything that is not a deferred apply is ignored, and `false`
+    /// comes back: the shell must make nothing active then. The report waits for the next
+    /// `poll`, which may be in a later session. No `Event` comes back: after an `Applied` the
+    /// shell must also call `Session::set_running`.
+    pub fn finish(&mut self, kind: ArtifactKind, version: u32, outcome: Outcome, reason: Reason) -> bool {
         let Some(at) = self
             .deferred
             .iter()
             .position(|m| m.kind() == Some(kind) && m.version == version)
         else {
-            return;
+            return false;
         };
         self.deferred.remove(at);
         match outcome {
@@ -319,6 +401,14 @@ impl Control {
             }
         }
         self.reports.push(report(kind as u32, version, outcome, reason));
+        true
+    }
+
+    /// Whether (`kind`, `version`) is a deferred apply waiting on `finish`.
+    pub fn is_deferred(&self, kind: ArtifactKind, version: u32) -> bool {
+        self.deferred
+            .iter()
+            .any(|m| m.kind() == Some(kind) && m.version == version)
     }
 
     /// An artifact the shell applied outside a live deferral, such as firmware that passed its
@@ -329,6 +419,14 @@ impl Control {
         self.raise(kind, version);
         self.reports
             .push(report(kind as u32, version, Outcome::Applied, Reason::None));
+    }
+
+    /// The failing twin of `report_applied`: an artifact the shell tried outside a live
+    /// deferral and gave up on, such as firmware that failed its probation after a reboot and
+    /// was rolled back (amended in the final review). Queues `Report{failed, reason}` for the
+    /// next `poll`, and (kind, version) is not fetched again this session.
+    pub fn report_failed(&mut self, kind: ArtifactKind, version: u32, reason: Reason) {
+        self.fail(kind, version, reason);
     }
 
     /// What runs never goes down.
@@ -384,6 +482,8 @@ impl Control {
             c.failed.insert((ArtifactKind::Trust, v));
             c.reports
                 .push(report(ArtifactKind::Trust as u32, v, Outcome::Refused, reason));
+            // What waited on this store is judged without it.
+            c.rejudge(None);
             Event::None
         };
         let size = m.size as usize;
@@ -405,10 +505,19 @@ impl Control {
         let Ok(signed) = SignedTrustStore::from_bytes(&bytes) else {
             return refuse(self, Reason::Signature);
         };
+        // The store must be the version its manifest names, or the version the device reports
+        // and the server records are not the store it holds (amended in the final review).
+        // Only the version is read before the anchor checks the signature.
+        if signed.open_unverified().map(|s| s.version) != Ok(v) {
+            return refuse(self, Reason::Signature);
+        }
         match anchor.offer(storage, &signed) {
             Ok(()) => {
                 self.reports
                     .push(report(ArtifactKind::Trust as u32, v, Outcome::Applied, Reason::None));
+                // Judge what is offered again under the new store: what it revokes is dropped,
+                // what its new keys sign is taken.
+                self.rejudge(Some(anchor.active()));
                 Event::TrustChanged
             }
             Err(OfferError::Refused(TrustError::NotNewer)) => refuse(self, Reason::NotNewer),
