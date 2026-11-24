@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod control;
+pub mod device;
 pub mod frame;
 pub mod log;
 pub mod mem_sink;
