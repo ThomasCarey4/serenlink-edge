@@ -4,6 +4,14 @@ use sl_core::meta::Meta;
 use sl_core::storage::{Storage, StorageError};
 use sl_proto::ids::Class;
 
+#[path = "storage_contract.rs"]
+mod storage_contract;
+
+#[test]
+fn mem_storage_meets_the_contract() {
+    storage_contract::check_all(&|capacity| MemStorage::new(capacity));
+}
+
 #[test]
 fn offsets_are_logical_and_survive_trimming() {
     let mut s = MemStorage::new(1_000);
