@@ -5,6 +5,7 @@ pub mod defines;
 pub mod file_store;
 pub mod identity;
 pub mod policy;
+pub mod run;
 pub mod signalk;
 pub mod sink;
 pub mod transport;
