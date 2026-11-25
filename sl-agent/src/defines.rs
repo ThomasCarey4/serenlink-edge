@@ -10,11 +10,12 @@ use sl_proto::value::{Value, ValueType};
 pub const MAX_BLOB_BYTES: usize = 4096;
 
 /// SignalK JSON as a wire value. `navigation.position` becomes a position in e7 degrees;
-/// other objects, arrays and strings become their JSON text as a blob. Null, a non-finite
-/// number, an out-of-range position and an oversized blob yield `None`.
+/// other objects, arrays and strings become their JSON text as a blob. Null becomes the blob
+/// `null`. A non-finite number, an out-of-range position and an oversized blob yield `None`.
 pub fn to_value(path: &str, v: &Json) -> Option<Value> {
     match v {
-        Json::Null => None,
+        // A blob, whose text is JSON: SignalK has no value for the path.
+        Json::Null => Some(Value::Blob(b"null".to_vec())),
         Json::Bool(b) => Some(Value::Bool(*b)),
         Json::Number(n) => n.as_f64().filter(|x| x.is_finite()).map(Value::F64),
         Json::Object(o) if path == "navigation.position" => {

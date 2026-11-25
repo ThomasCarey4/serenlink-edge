@@ -1,8 +1,8 @@
 use serde_json::json;
-use sl_agent::signalk::{names, parse_delta, sources_url};
+use sl_agent::signalk::{names, parse_delta, sources_url, utc_ms};
 
 #[test]
-fn a_delta_yields_each_value_with_its_source_and_skips_nulls_and_meta() {
+fn a_delta_yields_each_value_with_its_source_time_and_null_and_skips_meta() {
     let u = parse_delta(include_str!("fixtures/delta-n2k.json"));
     let got: Vec<_> = u.iter().map(|u| (u.path.as_str(), u.source.as_str())).collect();
     assert_eq!(
@@ -10,11 +10,14 @@ fn a_delta_yields_each_value_with_its_source_and_skips_nulls_and_meta() {
         [
             ("navigation.position", "can0.115"),
             ("navigation.speedThroughWater", "can0.35"),
+            ("navigation.log", "can0.35"),
             ("electrical.batteries.0.voltage", "venus.com.victronenergy.battery"),
             ("electrical.batteries.0.name", "venus.com.victronenergy.battery"),
         ]
     );
     assert_eq!(u[1].value, json!(2.31));
+    assert_eq!(u[2].value, json!(null));
+    assert_eq!(u[1].utc_ms, Some(1_795_514_400_100));
 }
 
 #[test]
@@ -49,4 +52,31 @@ fn the_sources_url_is_on_the_streams_host() {
         Some("https://h:3443/signalk/v1/api/sources")
     );
     assert_eq!(sources_url("bogus"), None);
+}
+
+#[test]
+fn times_are_read_to_the_millisecond_and_bad_ones_are_not_read() {
+    assert_eq!(utc_ms("1970-01-01T00:00:00Z"), Some(0));
+    assert_eq!(utc_ms("2000-02-29T23:59:59.9Z"), Some(951_868_799_900));
+    assert_eq!(utc_ms("2024-03-01T00:00:00.1239Z"), Some(1_709_251_200_123));
+    for bad in [
+        "",
+        "Z",
+        "2026-13-01T00:00:00Z",
+        "2026-11-25",
+        "2026-11-25T11:28:22+01:00",
+        "2026-11-25T1:28:22Z",
+        "2026-11-25T11:28:22.Z",
+    ] {
+        assert_eq!(utc_ms(bad), None, "{bad}");
+    }
+}
+
+#[test]
+fn a_values_own_time_comes_before_its_updates() {
+    let u = parse_delta(
+        r#"{"updates":[{"timestamp":"1970-01-01T00:00:01Z","values":[
+            {"path":"a.b","value":1,"timestamp":"1970-01-01T00:00:02Z"},{"path":"a.c","value":1}]}]}"#,
+    );
+    assert_eq!((u[0].utc_ms, u[1].utc_ms), (Some(2_000), Some(1_000)));
 }

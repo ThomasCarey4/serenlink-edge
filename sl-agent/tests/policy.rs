@@ -97,3 +97,30 @@ fn the_lists_are_the_compressors() {
         );
     }
 }
+
+#[test]
+fn a_null_is_recorded_once_at_once_and_the_next_value_is_recorded() {
+    let mut p = Policy::new();
+    let null = json!(null);
+    for (path, value, every, class) in [
+        ("navigation.speedOverGround", json!(1.5), 2_000, Class::P1),
+        ("propulsion.port.gear", json!("neutral"), 5_000, Class::P0),
+        (
+            "navigation.position",
+            json!({"latitude": 50.1, "longitude": -1.2}),
+            1_000,
+            Class::P0,
+        ),
+    ] {
+        assert_eq!(p.decide(path, &value, 10_000), Some(class), "{path}");
+        assert_eq!(p.decide(path, &null, 10_001), Some(class), "{path}");
+        assert_eq!(p.decide(path, &null, 30_000), None, "{path}");
+        assert_eq!(
+            p.decide(path, &value, 10_000 + every),
+            Some(class),
+            "{path}: the same value again"
+        );
+        assert_eq!(p.decide(path, &null, 10_001 + every), Some(class), "{path}");
+    }
+    assert_eq!(p.decide("design.length", &null, 0), None);
+}

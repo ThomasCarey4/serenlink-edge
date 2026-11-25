@@ -1,6 +1,6 @@
 //! What the agent records, and how often: the old compressor's choice, unchanged (agent spec
 //! 3.3), so the dual-run compares like with like. The rules engine replaces it later.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -98,6 +98,8 @@ fn is_zero_position(v: &Json) -> bool {
 pub struct Policy {
     last_at: HashMap<String, u64>,
     last_state: HashMap<String, Json>,
+    /// Paths whose last recorded value is null.
+    null: HashSet<String>,
 }
 
 impl Policy {
@@ -113,6 +115,13 @@ impl Policy {
             Category::State => (Class::P0, STATE_EVERY_MS),
             Category::Sensor => (Class::P1, SENSOR_EVERY_MS),
         };
+        // A null is recorded once, when the path stops having a value (or has none when first
+        // heard), outside the rate limit: the last word of a source that went away must not be
+        // lost to a value recorded just before it. The compressor repeats nulls.
+        if value.is_null() {
+            self.last_state.remove(path);
+            return self.null.insert(path.to_string()).then_some(class);
+        }
         // The compressor's RateLimiter: a path never seen counts as last sent at time 0, and the
         // window is stamped before any later check can drop the sample.
         let last = self.last_at.get(path).copied();
@@ -127,9 +136,13 @@ impl Policy {
                     return None;
                 }
                 self.last_state.insert(path.to_string(), value.clone());
+                self.null.remove(path);
                 Some(class)
             }
-            _ => Some(class),
+            _ => {
+                self.null.remove(path);
+                Some(class)
+            }
         }
     }
 }

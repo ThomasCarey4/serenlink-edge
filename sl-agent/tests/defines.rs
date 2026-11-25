@@ -22,7 +22,10 @@ fn json_maps_to_values() {
         to_value("a", &json!({"x": [1]})),
         Some(Value::Blob(br#"{"x":[1]}"#.to_vec()))
     );
-    assert_eq!(to_value("a", &serde_json::Value::Null), None);
+    assert_eq!(
+        to_value("a", &serde_json::Value::Null),
+        Some(Value::Blob(b"null".to_vec()))
+    );
 }
 
 #[test]

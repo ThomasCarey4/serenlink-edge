@@ -42,6 +42,7 @@ use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout, t
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{self, Message};
 
+use crate::cached::Gate;
 use crate::clock::Clock;
 use crate::defines::{Defines, to_value};
 use crate::file_store::{FileStore, create_dir_durable};
@@ -183,22 +184,51 @@ async fn signalk(url: String, clock: Clock, tx: mpsc::Sender<(Update, u64, u64)>
                 backoff = Duration::from_secs(1);
                 // A new connection may fetch the names again for any source.
                 let mut fetches = NameFetches::default();
+                let mut gate = Gate::new(clock.mono_ms());
+                let mut heard = Instant::now();
                 loop {
-                    let msg = match tokio::time::timeout(SIGNALK_IDLE, ws.next()).await {
-                        Ok(Some(Ok(m))) => m,
+                    let idle_at = heard + SIGNALK_IDLE;
+                    let wake = gate
+                        .due_in(clock.mono_ms())
+                        .map_or(idle_at, |ms| idle_at.min(Instant::now() + Duration::from_millis(ms)));
+                    let next = timeout_at(wake, ws.next()).await;
+                    let mono = clock.mono_ms();
+                    let mut updates = Vec::new();
+                    if gate.due_in(mono) == Some(0) {
+                        updates = gate.release(mono);
+                        eprintln!(
+                            "SignalK: of what it replayed, {} old states recorded, {} old values dropped",
+                            updates.len(),
+                            gate.dropped
+                        );
+                    }
+                    let msg = match next {
+                        Ok(Some(Ok(m))) => Some(m),
                         Ok(Some(Err(e))) => {
                             eprintln!("SignalK: {e}");
                             break;
                         }
                         Ok(None) => break,
+                        Err(_) if Instant::now() < idle_at => None,
                         Err(_) => {
                             eprintln!("SignalK: nothing for {SIGNALK_IDLE:?}, reconnecting");
                             break;
                         }
                     };
-                    let mono = clock.mono_ms();
-                    let Message::Text(text) = msg else { continue };
-                    for u in parse_delta(text.as_str()) {
+                    if msg.is_some() {
+                        heard = Instant::now();
+                    }
+                    if let Some(Message::Text(text)) = msg {
+                        let utc = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map_or(0, |d| d.as_millis() as u64);
+                        updates.extend(
+                            parse_delta(text.as_str())
+                                .into_iter()
+                                .filter_map(|u| gate.admit(u, mono, utc)),
+                        );
+                    }
+                    for u in updates {
                         let name = known.lock().unwrap_or_else(|e| e.into_inner()).get(&u.source).copied();
                         if name.is_none()
                             && let Some(src_url) = &names_url
