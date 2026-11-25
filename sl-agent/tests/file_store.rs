@@ -103,29 +103,45 @@ fn segments_left_below_the_start_by_a_trim_are_deleted_at_open() {
 }
 
 #[test]
-fn a_truncate_cut_short_by_a_crash_is_finished_at_open() {
+fn a_short_segment_followed_by_more_fails_the_open_and_deletes_nothing() {
+    // A truncate syncs its deletes before it cuts the tail, so no crash leaves a short segment
+    // with later ones after it: that is damage, and the log is kept whole for the agent to set
+    // aside.
     let dir = tempfile::tempdir().unwrap();
     let mut s = FileStore::open_with_segment(dir.path(), 1_000, 4).unwrap();
     s.append(Class::P1, b"abcdefghijkl").unwrap();
     drop(s);
     let p1 = dir.path().join("p1");
-    assert_eq!(segments(&p1), [0, 4, 8]);
-    // A truncate to 6 shortened segment 4, but its delete of segment 8 was lost.
     fs::OpenOptions::new()
         .write(true)
         .open(seg_path(&p1, 4))
         .unwrap()
         .set_len(2)
         .unwrap();
+    assert!(FileStore::open_with_segment(dir.path(), 1_000, 4).is_err());
+    assert_eq!(segments(&p1), [0, 4, 8]);
+}
+
+#[test]
+fn a_truncate_interrupted_between_its_deletes_leaves_a_lane_that_opens() {
+    // Deletes go newest first and are synced before the cut: a crash part way leaves the lane
+    // contiguous and longer than meant, which the log's recovery truncates again.
+    let dir = tempfile::tempdir().unwrap();
     let mut s = FileStore::open_with_segment(dir.path(), 1_000, 4).unwrap();
-    assert_eq!((s.start(Class::P1), s.end(Class::P1)), (0, 6));
-    assert_eq!(segments(&p1), [0, 4]);
-    s.append(Class::P1, b"XYZ").unwrap();
+    s.append(Class::P1, b"abcdefghijkl").unwrap();
+    drop(s);
+    let p1 = dir.path().join("p1");
+    // A truncate to 2 deleted segment 8 and crashed before deleting 4 and cutting 0.
+    fs::remove_file(seg_path(&p1, 8)).unwrap();
+    let mut s = FileStore::open_with_segment(dir.path(), 1_000, 4).unwrap();
+    assert_eq!((s.start(Class::P1), s.end(Class::P1)), (0, 8));
+    s.truncate(Class::P1, 2).unwrap();
+    s.append(Class::P1, b"XY").unwrap();
     drop(s);
     let s = FileStore::open_with_segment(dir.path(), 1_000, 4).unwrap();
-    let mut buf = [0u8; 9];
+    let mut buf = [0u8; 4];
     s.read(Class::P1, 0, &mut buf).unwrap();
-    assert_eq!(&buf, b"abcdefXYZ");
+    assert_eq!(&buf, b"abXY");
 }
 
 #[test]

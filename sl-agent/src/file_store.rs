@@ -6,9 +6,10 @@
 //! files replaced by rename.
 //!
 //! At open, what a crash can leave is put right: segments wholly below the recorded start (a
-//! trim whose deletes were not yet durable) are deleted, and segments after a short one (a
-//! truncate whose deletes were not yet durable when the tail was shortened) are deleted. A gap
-//! after a full segment, or an overlap, is damage, and fails the open.
+//! trim whose deletes were not yet durable) are deleted. A truncate's deletes are durable before
+//! it shortens the tail, so a crash leaves the lane contiguous (the log's own recovery then cuts
+//! the torn tail again). Any gap between segments, or an overlap, is therefore damage, and fails
+//! the open; the agent then sets the whole log aside rather than delete any of it.
 use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -85,7 +86,7 @@ fn io_err(_: io::Error) -> StorageError {
 }
 
 impl Lane {
-    fn open(dir: PathBuf, segment_bytes: u64) -> io::Result<Self> {
+    fn open(dir: PathBuf) -> io::Result<Self> {
         create_dir_durable(&dir)?;
         let mut segments = Vec::new();
         for entry in fs::read_dir(&dir)? {
@@ -117,34 +118,16 @@ impl Lane {
             segments.retain(|&(o, l)| o + l > r);
             removed |= !below.is_empty();
         }
-        // A truncate deletes the segments past the new end, syncs, then shortens the last
-        // one. Should the shortening reach the disk and the deletes not, the segment it
-        // shortened is followed by ones that are no longer part of the lane.
-        let mut keep = segments.len();
-        for i in 0..segments.len().saturating_sub(1) {
-            let ((off, len), (next, _)) = (segments[i], segments[i + 1]);
-            if off + len == next {
-                continue;
+        // Anything else is damage: a truncate's deletes reach the disk before its tail is cut.
+        for w in segments.windows(2) {
+            let ((off, len), (next, _)) = (w[0], w[1]);
+            if off + len != next {
+                return Err(io::Error::other(format!(
+                    "{}: segments not contiguous at {off}",
+                    dir.display()
+                )));
             }
-            if off + len < next && len < segment_bytes {
-                eprintln!(
-                    "{}: segment {off} is short and followed by {}; deleting those left by a truncate",
-                    dir.display(),
-                    segments.len() - i - 1
-                );
-                keep = i + 1;
-                break;
-            }
-            return Err(io::Error::other(format!(
-                "{}: segments not contiguous at {off}",
-                dir.display()
-            )));
         }
-        for &(off, _) in segments[keep..].iter().rev() {
-            fs::remove_file(dir.join(seg_name(off)))?;
-            removed = true;
-        }
-        segments.truncate(keep);
         if removed {
             sync_dir(&dir)?;
         }
@@ -233,7 +216,7 @@ impl FileStore {
     pub fn open_with_segment(dir: &Path, capacity: u64, segment_bytes: u64) -> io::Result<Self> {
         create_dir_durable(&dir.join("meta"))?;
         let segment_bytes = segment_bytes.max(1);
-        let lane = |c: &str| Lane::open(dir.join(c), segment_bytes);
+        let lane = |c: &str| Lane::open(dir.join(c));
         Ok(Self {
             dir: dir.to_path_buf(),
             capacity,
