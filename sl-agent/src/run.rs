@@ -45,7 +45,7 @@ use tokio_tungstenite::tungstenite::{self, Message};
 use crate::clock::Clock;
 use crate::defines::{Defines, to_value};
 use crate::file_store::{FileStore, create_dir_durable};
-use crate::identity::{load_or_create_seed, next_boot, restart_boot_from_clock};
+use crate::identity::{CLOCK_SET_AFTER, load_or_create_seed, resolve_boot};
 use crate::policy::Policy;
 use crate::signalk::{Update, names, parse_delta, sources_url};
 use crate::sink::AgentSink;
@@ -442,6 +442,53 @@ pub fn open_device(
     }
 }
 
+/// The wall clock in seconds, once it is set: waits (blocking) until then, saying so once a
+/// minute. Only a damaged or lost boot counter needs it.
+fn wait_for_clock() -> u64 {
+    let mut said: Option<std::time::Instant> = None;
+    loop {
+        let now = unix_secs();
+        if now >= CLOCK_SET_AFTER {
+            return now;
+        }
+        if said.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+            said = Some(std::time::Instant::now());
+            eprintln!(
+                "<4>sl-agent: the boot counter must restart from the wall clock, which is not set; \
+                 waiting (SignalK is queued meanwhile)"
+            );
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// The newest boot id in the log at `dir`: the boot of the newest readable frame of each class.
+/// `None` when there is no log or it will not open.
+pub fn highest_boot_in_log(dir: &Path) -> Option<u32> {
+    use sl_core::log::DurableLog;
+    if !dir.is_dir() {
+        return None;
+    }
+    let store = FileStore::open(dir, u64::MAX).ok()?;
+    let (mut log, _) = DurableLog::open(store).ok()?;
+    let mut best = None;
+    for class in Class::ALL {
+        let next = log.next_seq(class);
+        if next == 0 || log.rewind(class, next - 1).is_err() {
+            continue;
+        }
+        let Ok(Some(frame)) = log.peek_unsent(class) else {
+            continue;
+        };
+        let boot = Compression::from_u8(frame.header.compression)
+            .and_then(|c| sl_proto::compress::decompress(c, &frame.payload, 16 << 20).ok())
+            .and_then(|raw| sl_proto::block::Block::decode(&raw).ok())
+            .map(|b| b.boot_id);
+        best = best.max(boot);
+    }
+    best
+}
+
 fn unix_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
@@ -471,18 +518,23 @@ pub async fn run(args: Args) -> Result<(), String> {
     let state = &args.state_dir;
     create_dir_durable(state).map_err(|e| format!("{}: {e}", state.display()))?;
     let seed = load_or_create_seed(&state.join("device.seed")).map_err(|e| e.to_string())?;
-    let boot_path = state.join("boot");
-    let boot_id = match next_boot(&boot_path) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("<3>sl-agent: ERROR: the boot counter: {e}; restarting it from the wall clock");
-            restart_boot_from_clock(&boot_path, unix_secs()).map_err(|e2| format!("the boot counter: {e}; {e2}"))?
-        }
-    };
     let clock = Clock::start();
-    // SignalK is read from here on, whatever opening the log costs.
+    // SignalK is read from here on, whatever resolving the boot id or opening the log costs:
+    // its updates are stamped on this process's timeline and queue until the loop runs.
     let (tx, mut rx) = mpsc::channel::<(Update, u64, u64)>(INTAKE);
     spawn_signalk(args.signalk_url.clone(), clock, tx)?;
+    // Blocking here is fine: nothing else runs on this runtime yet, and SignalK has its own.
+    let boot = resolve_boot(state, &mut wait_for_clock, &mut || {
+        highest_boot_in_log(&state.join("log"))
+    })
+    .map_err(|e| format!("the boot counter: {e}"))?;
+    if let Some(why) = &boot.restarted {
+        eprintln!(
+            "<3>sl-agent: ERROR: the boot counter: {why}; restarted from the wall clock at {}",
+            boot.id
+        );
+    }
+    let boot_id = boot.id;
     let cfg = DeviceConfig {
         device_id,
         seed,
