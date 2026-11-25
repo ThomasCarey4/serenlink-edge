@@ -332,21 +332,17 @@ impl Storage for FileStore {
             return Ok(());
         }
         lane.tail = None;
-        let mut removed = false;
-        // Newest first, so a crash part way leaves the lane contiguous.
+        // Newest first, each synced before the next, so no reordering by the filesystem can
+        // leave a gap; and all of them durable before the tail is shortened (see `Lane::open`).
         while let Some(&last) = lane.segments.last() {
             if last >= new_end && lane.segments.len() > 1 {
                 lane.forget(last);
                 fs::remove_file(lane.dir.join(seg_name(last))).map_err(io_err)?;
                 lane.segments.pop();
-                removed = true;
+                sync_dir(&lane.dir).map_err(io_err)?;
             } else {
                 break;
             }
-        }
-        // The deletes are durable before the tail is shortened (see `Lane::open`).
-        if removed {
-            sync_dir(&lane.dir).map_err(io_err)?;
         }
         if let Some(&last) = lane.segments.last() {
             let f = OpenOptions::new()
