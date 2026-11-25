@@ -1,7 +1,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
-use sl_agent::run::{RUNNING, open_device};
+use sl_agent::run::{RUNNING, highest_boot_in_log, open_device};
 use sl_core::device::DeviceConfig;
 use sl_core::recorder::RecorderConfig;
 use sl_core::storage::Storage as _;
@@ -86,4 +86,77 @@ fn a_log_is_left_in_place_when_no_fresh_one_can_be_made() {
         .map(|e| e.unwrap().file_name())
         .collect();
     assert_eq!(names, ["log"]);
+}
+
+fn trust_version(log: &std::path::Path) -> u32 {
+    let store = sl_agent::file_store::FileStore::open(log, 1 << 30).unwrap();
+    sl_core::trust::TrustAnchor::open(&store, &baseline())
+        .unwrap()
+        .active()
+        .version
+}
+
+#[test]
+fn a_set_aside_log_hands_its_newer_trust_store_to_the_fresh_one() {
+    use sl_proto::auth::{KeySigner, Signer as _};
+    use sl_proto::trust::{ReleaseKey, TrustStore};
+    let state = tempfile::tempdir().unwrap();
+    drop(open_device(state.path(), 1 << 30, cfg(), &baseline(), 1).unwrap());
+    let log = state.path().join("log");
+    {
+        let mut store = sl_agent::file_store::FileStore::open(&log, 1 << 30).unwrap();
+        let mut anchor = sl_core::trust::TrustAnchor::open(&store, &baseline()).unwrap();
+        let seed = [0x11; 32];
+        let next = TrustStore {
+            version: 2,
+            release_keys: vec![ReleaseKey {
+                id: 1,
+                pubkey: KeySigner::from_seed(seed).public_key().to_vec(),
+            }],
+            min_serial: 1,
+            revoked_serials: vec![],
+            tls_roots: vec![],
+        };
+        anchor
+            .offer(&mut store, &SignedTrustStore::sign(&next, 1, &seed))
+            .unwrap();
+    }
+    assert_eq!(trust_version(&log), 2);
+    // The other slot holds rot, which must not be carried.
+    let meta = log.join("meta");
+    let rot_slot = if meta.join("2").exists() { "3" } else { "2" };
+    fs::write(meta.join(rot_slot), b"rot").unwrap();
+    fs::write(log.join("p0").join("start"), [1, 2, 3]).unwrap();
+
+    let (dev, _, moved) = open_device(state.path(), 1 << 30, cfg(), &baseline(), 1_790_000_000).unwrap();
+    assert!(moved.is_some());
+    drop(dev);
+    assert_eq!(trust_version(&log), 2);
+    assert!(!log.join("meta").join(rot_slot).exists());
+}
+
+#[test]
+fn the_highest_boot_in_a_log_is_its_newest_frames() {
+    use sl_proto::record::{Define, Kind};
+    use sl_proto::value::{Value, ValueType};
+    let state = tempfile::tempdir().unwrap();
+    let log = state.path().join("log");
+    assert_eq!(highest_boot_in_log(&log), None);
+    for boot in [3, 7] {
+        let mut c = cfg();
+        c.boot_id = boot;
+        let (mut dev, _, _) = open_device(state.path(), 1 << 30, c, &baseline(), 1).unwrap();
+        let def = Define {
+            local_id: 1,
+            stable_key: 0,
+            path: "navigation.speedOverGround".into(),
+            source: 0,
+            value_type: ValueType::F64,
+            unit: String::new(),
+            kind: Kind::Linear,
+        };
+        dev.sample(Class::P1, &def, 10, Value::F64(1.0));
+        dev.flush(20, &mut Vec::new()).unwrap();
+    }
+    assert_eq!(highest_boot_in_log(&log), Some(7));
 }

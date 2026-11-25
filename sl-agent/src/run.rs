@@ -390,6 +390,34 @@ pub fn open_log(
     })
 }
 
+/// Copy the trust store slots of the log at `old` into `fresh`, each only if it holds an intact
+/// store newer than `baseline` (as `TrustAnchor::open` would take it). Returns how many went.
+/// The old log will not open, so its slot files are read directly.
+fn carry_trust(old: &Path, fresh: &mut FileStore, baseline: &SignedTrustStore) -> Result<usize, String> {
+    use sl_core::mem_storage::MemStorage;
+    use sl_core::storage::Storage as _;
+    use sl_core::trust::{TRUST_SLOTS, TrustAnchor};
+    let version = |m: &MemStorage| TrustAnchor::open(m, baseline).ok().map(|a| a.active().version);
+    let Some(base) = version(&MemStorage::new(0)) else {
+        return Ok(0);
+    };
+    let mut carried = 0;
+    for slot in TRUST_SLOTS {
+        let Ok(bytes) = std::fs::read(old.join("meta").join(slot.to_string())) else {
+            continue;
+        };
+        let mut probe = MemStorage::new(0);
+        if probe.write_meta(slot, &bytes).is_err() || version(&probe).is_none_or(|v| v <= base) {
+            continue;
+        }
+        fresh
+            .write_meta(slot, &bytes)
+            .map_err(|e| format!("copying trust slot {slot}: {e:?}"))?;
+        carried += 1;
+    }
+    Ok(carried)
+}
+
 /// Open the device over `state/log`. A log that will not open is set aside, once: a fresh
 /// log is made beside it first (so a full or read-only disk leaves the old log where it is),
 /// then the old one is renamed `log.broken-<now_secs>` and the fresh one put in its place.
@@ -413,11 +441,20 @@ pub fn open_device(
     if fresh.exists() {
         std::fs::remove_dir_all(&fresh).map_err(|e| format!("{}: {e}", fresh.display()))?;
     }
-    if let Err(e) = FileStore::open(&fresh, capacity) {
-        let _ = std::fs::remove_dir_all(&fresh);
-        return Err(format!(
-            "the log will not open ({first}), and a fresh one cannot be made beside it ({e}); left as it is"
-        ));
+    let made = FileStore::open(&fresh, capacity)
+        .map_err(|e| e.to_string())
+        .and_then(|mut store| carry_trust(&log, &mut store, baseline));
+    let carried = match made {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&fresh);
+            return Err(format!(
+                "the log will not open ({first}), and a fresh one cannot be made beside it ({e}); left as it is"
+            ));
+        }
+    };
+    if carried > 0 {
+        eprintln!("sl-agent: carried {carried} trust store slot(s) from the old log into the fresh one");
     }
     let mut broken = state.join(format!("log.broken-{now_secs}"));
     let mut n = 1;
