@@ -1,6 +1,6 @@
 use std::os::unix::fs::PermissionsExt;
 
-use sl_agent::identity::{load_or_create_seed, next_boot};
+use sl_agent::identity::{load_or_create_seed, next_boot, restart_boot_from_clock};
 
 #[test]
 fn a_seed_is_made_once_private_and_then_kept() {
@@ -27,4 +27,21 @@ fn boots_count_up_from_one() {
     assert_eq!(next_boot(&p).unwrap(), 1);
     assert_eq!(next_boot(&p).unwrap(), 2);
     assert_eq!(next_boot(&p).unwrap(), 3);
+}
+
+#[test]
+fn a_damaged_counter_restarts_from_the_clock_and_counts_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("boot");
+    std::fs::write(&p, [1, 2, 3]).unwrap();
+    assert!(next_boot(&p).is_err());
+    // An unset clock gives no id known to be new.
+    assert!(restart_boot_from_clock(&p, 1_000).is_err());
+    let now = 1_790_000_000;
+    assert_eq!(restart_boot_from_clock(&p, now).unwrap(), now as u32);
+    assert_eq!(
+        std::fs::read(dir.path().join(format!("boot.broken-{now}"))).unwrap(),
+        [1, 2, 3]
+    );
+    assert_eq!(next_boot(&p).unwrap(), now as u32 + 1);
 }

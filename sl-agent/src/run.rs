@@ -5,21 +5,28 @@
 //! `run` returns an error, so the process exits non-zero and systemd starts a new boot that
 //! reopens and recovers the log.
 //!
-//! Recording never waits on the network: SignalK updates are stamped when they arrive, and a
-//! gateway connection writes on its own task through a bounded queue (`Link`). A full queue, a
-//! send that waits longer than the gateway's idle timeout, or a gateway silent that long drops
-//! the session, which the device rewinds on its next Hello.
-use std::collections::HashMap;
+//! Recording never waits on the network or the disk: SignalK is read, and its updates stamped
+//! as they arrive, on a thread of its own (started before the log is opened), into a bounded
+//! queue that the loop records from; and a gateway connection writes on its own task through a
+//! bounded queue (`Link`). A full queue, a send that waits longer than the gateway's idle
+//! timeout, or a gateway silent that long drops the session, which the device rewinds on its
+//! next Hello.
+//!
+//! A log that cannot be opened is set aside as `log.broken-<secs>` and a fresh one started,
+//! once per process (`open_device`), so a damaged log does not become a restart loop.
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as _;
-use sl_core::device::{Device, DeviceConfig};
+use sl_core::device::{Device, DeviceConfig, OpenDeviceError};
+use sl_core::log::Recovery;
 use sl_core::recorder::RecorderConfig;
 use sl_core::session::SessionError;
 use sl_proto::auth::{KeySigner, Signer as _};
@@ -37,8 +44,8 @@ use tokio_tungstenite::tungstenite::{self, Message};
 
 use crate::clock::Clock;
 use crate::defines::{Defines, to_value};
-use crate::file_store::FileStore;
-use crate::identity::{load_or_create_seed, next_boot};
+use crate::file_store::{FileStore, create_dir_durable};
+use crate::identity::{load_or_create_seed, next_boot, restart_boot_from_clock};
 use crate::policy::Policy;
 use crate::signalk::{Update, names, parse_delta, sources_url};
 use crate::sink::AgentSink;
@@ -54,6 +61,11 @@ const SIGNALK_IDLE: Duration = Duration::from_secs(60);
 const CONNECT_WITHIN: Duration = Duration::from_secs(15);
 const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// A session that lasts this long resets the backoff; one that is welcomed and then lost
+/// sooner (a gateway that refuses after the handshake, say) keeps it growing.
+const STAYED_UP: Duration = Duration::from_secs(60);
+/// The sources document is fetched at most this often.
+const NAMES_EVERY: Duration = Duration::from_secs(60);
 const INTAKE: usize = 8_192;
 /// The gateway's idle timeout (`sl-gateway serve --idle-secs`, default 90; it pings every 30):
 /// a gateway heard from for no longer than this is gone, and so is a send that waits this long.
@@ -97,7 +109,7 @@ fn need<T: Clone>(v: &Option<T>, flag: &str) -> Result<T, String> {
 }
 
 pub fn print_pubkey(args: &Args) -> Result<(), String> {
-    std::fs::create_dir_all(&args.state_dir).map_err(|e| format!("{}: {e}", args.state_dir.display()))?;
+    create_dir_durable(&args.state_dir).map_err(|e| format!("{}: {e}", args.state_dir.display()))?;
     let seed = load_or_create_seed(&args.state_dir.join("device.seed")).map_err(|e| e.to_string())?;
     println!("{}", hex::encode(KeySigner::from_seed(seed).public_key()));
     Ok(())
@@ -105,14 +117,32 @@ pub fn print_pubkey(args: &Args) -> Result<(), String> {
 
 type Connecting = Pin<Box<dyn Future<Output = Result<(Ws, [u8; 32]), String>>>>;
 
-/// SignalK into `tx` for ever, reconnecting with backoff; `$source` NAMEs refreshed from the
-/// sources document at each connect and when an unknown source appears (at most once a minute).
-/// An update that finds the channel full is dropped and counted.
-/// Each update goes with its `$source` NAME and the time it arrived, on the agent's clock.
+/// Read SignalK on a thread of its own, so that nothing the loop waits on (opening the log, a
+/// rewind, an fsync) delays an update's arrival stamp. The thread ends when the loop drops its
+/// receiver.
+fn spawn_signalk(url: String, clock: Clock, tx: mpsc::Sender<(Update, u64, u64)>) -> Result<(), String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("the SignalK runtime: {e}"))?;
+    std::thread::Builder::new()
+        .name("signalk".into())
+        .spawn(move || rt.block_on(signalk(url, clock, tx)))
+        .map_err(|e| format!("the SignalK thread: {e}"))?;
+    Ok(())
+}
+
+/// SignalK into `tx` for ever, reconnecting with backoff. `$source` NAMEs come from the sources
+/// document, fetched on a task of its own when a source appears that the last document did
+/// not name, at most once a minute; a source that a fetch it started still did not name (one
+/// that is not on NMEA 2000, say) starts no other fetch until SignalK reconnects. An update
+/// whose source is not named yet goes with NAME 0. An update that finds the channel full is
+/// dropped and counted. Each update goes with its NAME and the time it arrived, on the agent's
+/// clock.
 async fn signalk(url: String, clock: Clock, tx: mpsc::Sender<(Update, u64, u64)>) {
     let mut backoff = Duration::from_secs(1);
     let names_url = sources_url(&url);
-    let mut known: HashMap<String, u64> = HashMap::new();
+    let known: Arc<Mutex<HashMap<String, u64>>> = Arc::default();
     let mut dropped: u64 = 0;
     let mut dropped_logged: Option<Instant> = None;
     loop {
@@ -120,8 +150,9 @@ async fn signalk(url: String, clock: Clock, tx: mpsc::Sender<(Update, u64, u64)>
             Ok((mut ws, _)) => {
                 eprintln!("SignalK connected: {url}");
                 backoff = Duration::from_secs(1);
-                // A new connection fetches the names again at its first update.
+                // A new connection may fetch the names again for any source.
                 let mut fetched_at: Option<Instant> = None;
+                let mut asked: HashSet<String> = HashSet::new();
                 loop {
                     let msg = match tokio::time::timeout(SIGNALK_IDLE, ws.next()).await {
                         Ok(Some(Ok(m))) => m,
@@ -138,32 +169,20 @@ async fn signalk(url: String, clock: Clock, tx: mpsc::Sender<(Update, u64, u64)>
                     let mono = clock.mono_ms();
                     let Message::Text(text) = msg else { continue };
                     for u in parse_delta(text.as_str()) {
-                        if !known.contains_key(&u.source)
-                            && fetched_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(60))
+                        let name = known.lock().unwrap_or_else(|e| e.into_inner()).get(&u.source).copied();
+                        if name.is_none()
+                            && !asked.contains(&u.source)
+                            && fetched_at.is_none_or(|t| t.elapsed() >= NAMES_EVERY)
                             && let Some(src_url) = &names_url
                         {
                             fetched_at = Some(Instant::now());
-                            let src_url = src_url.clone();
-                            let doc = tokio::task::spawn_blocking(move || {
-                                ureq::get(&src_url)
-                                    .timeout(Duration::from_secs(5))
-                                    .call()
-                                    .ok()?
-                                    .into_json::<serde_json::Value>()
-                                    .ok()
-                            })
-                            .await
-                            .ok()
-                            .flatten();
-                            if let Some(doc) = doc {
-                                known = names(&doc);
-                            }
+                            asked.insert(u.source.clone());
+                            tokio::spawn(fetch_names(src_url.clone(), known.clone()));
                         }
-                        let name = known.get(&u.source).copied().unwrap_or(0);
-                        match tx.try_send((u, name, mono)) {
+                        match tx.try_send((u, name.unwrap_or(0), mono)) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
-                                // The device task is far behind: dropping is the intake budget.
+                                // The device loop is far behind: dropping is the intake budget.
                                 dropped += 1;
                                 if dropped_logged.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
                                     dropped_logged = Some(Instant::now());
@@ -179,6 +198,24 @@ async fn signalk(url: String, clock: Clock, tx: mpsc::Sender<(Update, u64, u64)>
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
+}
+
+/// Fetch the sources document and, if it came, make its NAMEs the known ones.
+async fn fetch_names(url: String, known: Arc<Mutex<HashMap<String, u64>>>) {
+    let doc = tokio::task::spawn_blocking(move || {
+        ureq::get(&url)
+            .timeout(Duration::from_secs(5))
+            .call()
+            .ok()?
+            .into_json::<serde_json::Value>()
+            .ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some(doc) = doc {
+        *known.lock().unwrap_or_else(|e| e.into_inner()) = names(&doc);
     }
 }
 
@@ -287,10 +324,12 @@ async fn write<T: AsyncRead + AsyncWrite + Unpin>(
 }
 
 /// The reconnect schedule: a failed attempt or a lost session waits the backoff (jittered),
-/// which doubles to five minutes; a Welcome resets it.
+/// which doubles to five minutes; a session that stayed up `STAYED_UP` after its Welcome
+/// resets it.
 struct Retry {
     at: Instant,
     backoff: Duration,
+    welcomed_at: Option<Instant>,
 }
 
 impl Retry {
@@ -298,17 +337,113 @@ impl Retry {
         Self {
             at: Instant::now(),
             backoff: BACKOFF_FIRST,
+            welcomed_at: None,
         }
     }
 
     fn failed(&mut self) {
-        self.at = Instant::now() + jitter(self.backoff);
+        let now = Instant::now();
+        if self.welcomed_at.take().is_some_and(|t| now - t >= STAYED_UP) {
+            self.backoff = BACKOFF_FIRST;
+        }
+        self.at = now + jitter(self.backoff);
         self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
     }
 
     fn welcomed(&mut self) {
-        self.backoff = BACKOFF_FIRST;
+        self.welcomed_at = Some(Instant::now());
     }
+}
+
+pub type AgentDevice = Device<FileStore, AgentSink>;
+
+/// Record one SignalK update, if the policy keeps it.
+fn record(dev: &mut AgentDevice, policy: &mut Policy, defines: &mut Defines, (u, name, at): (Update, u64, u64)) {
+    if let Some(class) = policy.decide(&u.path, &u.value, at)
+        && let Some(value) = to_value(&u.path, &u.value)
+    {
+        let def = defines.get(&u.path, name, value.value_type()).clone();
+        dev.sample(class, &def, at, value);
+    }
+}
+
+/// Why `open_device` failed.
+#[derive(Debug)]
+pub enum OpenFailure {
+    /// The log itself: its files, or what is in them.
+    Log(String),
+    /// Anything else, which a fresh log would not mend (the baseline trust store).
+    Other(String),
+}
+
+/// Open the device over the log in `dir`.
+pub fn open_log(
+    dir: &Path,
+    capacity: u64,
+    cfg: DeviceConfig,
+    baseline: &SignedTrustStore,
+) -> Result<(AgentDevice, Recovery), OpenFailure> {
+    let store = FileStore::open(dir, capacity).map_err(|e| OpenFailure::Log(format!("{}: {e}", dir.display())))?;
+    Device::open(cfg, store, AgentSink::default(), baseline).map_err(|e| match e {
+        OpenDeviceError::Storage(e) => OpenFailure::Log(format!("{}: reading the log: {e:?}", dir.display())),
+        OpenDeviceError::Trust(e) => OpenFailure::Other(format!("the baseline trust store: {e:?}")),
+    })
+}
+
+/// Open the device over `state/log`. A log that will not open is set aside, once: a fresh
+/// log is made beside it first (so a full or read-only disk leaves the old log where it is),
+/// then the old one is renamed `log.broken-<now_secs>` and the fresh one put in its place.
+/// Returns where the broken log went, if it was moved.
+pub fn open_device(
+    state: &Path,
+    capacity: u64,
+    cfg: DeviceConfig,
+    baseline: &SignedTrustStore,
+    now_secs: u64,
+) -> Result<(AgentDevice, Recovery, Option<PathBuf>), String> {
+    let log = state.join("log");
+    let first = match open_log(&log, capacity, cfg.clone(), baseline) {
+        Ok((dev, recovery)) => return Ok((dev, recovery, None)),
+        Err(OpenFailure::Other(e)) => return Err(e),
+        Err(OpenFailure::Log(e)) => e,
+    };
+    // `<3>`: journald's error priority.
+    eprintln!("<3>sl-agent: ERROR: the log will not open: {first}");
+    let fresh = state.join(format!("log.new-{now_secs}"));
+    if fresh.exists() {
+        std::fs::remove_dir_all(&fresh).map_err(|e| format!("{}: {e}", fresh.display()))?;
+    }
+    if let Err(e) = FileStore::open(&fresh, capacity) {
+        let _ = std::fs::remove_dir_all(&fresh);
+        return Err(format!(
+            "the log will not open ({first}), and a fresh one cannot be made beside it ({e}); left as it is"
+        ));
+    }
+    let mut broken = state.join(format!("log.broken-{now_secs}"));
+    let mut n = 1;
+    while broken.exists() {
+        broken = state.join(format!("log.broken-{now_secs}-{n}"));
+        n += 1;
+    }
+    let moved = std::fs::rename(&log, &broken)
+        .and_then(|()| std::fs::rename(&fresh, &log))
+        .and_then(|()| std::fs::File::open(state)?.sync_all());
+    if let Err(e) = moved {
+        return Err(format!("setting the log aside as {}: {e}", broken.display()));
+    }
+    eprintln!(
+        "<3>sl-agent: ERROR: the log was moved to {} and a fresh log started; what it held that \
+         was not yet uploaded is in it, and will not be sent (see ops/sl-agent/ROLLOUT.md)",
+        broken.display()
+    );
+    match open_log(&log, capacity, cfg, baseline) {
+        Ok((dev, recovery)) => Ok((dev, recovery, Some(broken))),
+        Err(OpenFailure::Log(e) | OpenFailure::Other(e)) => Err(format!("the fresh log will not open either: {e}")),
+    }
+}
+
+fn unix_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 /// What one turn of the loop decided beyond its own arm.
@@ -334,11 +469,20 @@ pub async fn run(args: Args) -> Result<(), String> {
         .and_then(|b| b.try_into().ok())
         .ok_or("--device-id: 16 bytes of hex")?;
     let state = &args.state_dir;
-    std::fs::create_dir_all(state).map_err(|e| format!("{}: {e}", state.display()))?;
+    create_dir_durable(state).map_err(|e| format!("{}: {e}", state.display()))?;
     let seed = load_or_create_seed(&state.join("device.seed")).map_err(|e| e.to_string())?;
-    let boot_id = next_boot(&state.join("boot")).map_err(|e| e.to_string())?;
+    let boot_path = state.join("boot");
+    let boot_id = match next_boot(&boot_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("<3>sl-agent: ERROR: the boot counter: {e}; restarting it from the wall clock");
+            restart_boot_from_clock(&boot_path, unix_secs()).map_err(|e2| format!("the boot counter: {e}; {e2}"))?
+        }
+    };
     let clock = Clock::start();
-    let store = FileStore::open(&state.join("log"), args.capacity).map_err(|e| format!("the log: {e}"))?;
+    // SignalK is read from here on, whatever opening the log costs.
+    let (tx, mut rx) = mpsc::channel::<(Update, u64, u64)>(INTAKE);
+    spawn_signalk(args.signalk_url.clone(), clock, tx)?;
     let cfg = DeviceConfig {
         device_id,
         seed,
@@ -353,8 +497,7 @@ pub async fn run(args: Args) -> Result<(), String> {
         max_batches_per_poll: 32,
         control_lane: true,
     };
-    let (mut dev, recovery) =
-        Device::open(cfg, store, AgentSink::default(), &baseline).map_err(|e| format!("opening the device: {e:?}"))?;
+    let (mut dev, recovery, _) = open_device(state, args.capacity, cfg, &baseline, unix_secs())?;
     let mut sealed = Vec::new();
     if let Err(e) = dev.report_recovery(&recovery, clock.mono_ms(), &mut sealed) {
         eprintln!("declaring the losses found at open failed ({e:?}); the next tick declares them");
@@ -370,9 +513,6 @@ pub async fn run(args: Args) -> Result<(), String> {
     if let Some(a) = clock.ntp_anchor() {
         dev.anchor(a);
     }
-
-    let (tx, mut rx) = mpsc::channel::<(Update, u64, u64)>(INTAKE);
-    tokio::spawn(signalk(args.signalk_url.clone(), clock, tx));
 
     let mut policy = Policy::new();
     let mut defines = Defines::new();
@@ -401,16 +541,14 @@ pub async fn run(args: Args) -> Result<(), String> {
         let turn = tokio::select! {
             _ = term.recv() => break,
             _ = int.recv() => break,
-            Some((u, name, at)) = rx.recv() => {
-                if let Some(class) = policy.decide(&u.path, &u.value, at)
-                    && let Some(value) = to_value(&u.path, &u.value)
-                {
-                    let def = defines.get(&u.path, name, value.value_type()).clone();
-                    dev.sample(class, &def, at, value);
+            r = rx.recv() => match r {
+                Some(update) => {
+                    record(&mut dev, &mut policy, &mut defines, update);
+                    // A sample never makes a frame sendable; the tick polls.
+                    Turn::Skip
                 }
-                // A sample never makes a frame sendable; the tick polls.
-                Turn::Skip
-            }
+                None => Turn::Fatal("the SignalK reader stopped".into()),
+            },
             _ = tick.tick() => {
                 sealed.clear();
                 match dev.tick(clock.mono_ms(), &mut sealed) {
@@ -522,7 +660,7 @@ pub async fn run(args: Args) -> Result<(), String> {
             },
         };
         if let Some(e) = fault {
-            eprintln!("{e}; ending this boot so the next one recovers the log");
+            eprintln!("{e}; ending this boot so the next one starts afresh");
             if let Some(l) = link.take() {
                 l.abort();
             }
@@ -541,8 +679,12 @@ pub async fn run(args: Args) -> Result<(), String> {
         std::process::exit(1);
     });
 
-    // Clean stop: seal, send what the credit allows, close.
+    // Clean stop: record what SignalK has already sent, seal, send what the credit allows, close.
     let deadline = Instant::now() + STOP_WITHIN;
+    rx.close();
+    while let Ok(update) = rx.try_recv() {
+        record(&mut dev, &mut policy, &mut defines, update);
+    }
     sealed.clear();
     if let Err(e) = dev.flush(clock.mono_ms(), &mut sealed) {
         eprintln!("sealing at stop failed: {e:?}");
@@ -580,7 +722,7 @@ type Tls = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
 
 /// The session is lost: drop the connection at once, tell the device (which rewinds to its
 /// upload cursor on the next Hello), and wait the backoff.
-fn lose(link: &mut Option<Link<Tls>>, dev: &mut Device<FileStore, AgentSink>, retry: &mut Retry, why: &str) {
+fn lose(link: &mut Option<Link<Tls>>, dev: &mut AgentDevice, retry: &mut Retry, why: &str) {
     eprintln!("{why}");
     if let Some(l) = link.take() {
         l.abort();
@@ -676,8 +818,8 @@ mod tests {
         assert!(link.queue(vec![env]).is_err());
     }
 
-    #[test]
-    fn backoff_doubles_to_five_minutes_and_a_welcome_resets_it() {
+    #[tokio::test(start_paused = true)]
+    async fn backoff_doubles_to_five_minutes_and_only_a_session_that_stays_up_resets_it() {
         let mut r = Retry::new();
         assert!(Instant::now() >= r.at);
         r.failed();
@@ -688,8 +830,22 @@ mod tests {
         }
         assert_eq!(r.backoff, BACKOFF_MAX);
         assert!(r.at <= Instant::now() + BACKOFF_MAX + BACKOFF_MAX / 4);
+        // Welcomed, then lost within the minute: the backoff stands.
         r.welcomed();
-        assert_eq!(r.backoff, BACKOFF_FIRST);
+        tokio::time::advance(STAYED_UP - Duration::from_secs(1)).await;
+        r.failed();
+        assert!(r.at >= Instant::now() + BACKOFF_MAX);
+        assert_eq!(r.backoff, BACKOFF_MAX);
+        // A failed connect after a lost session is not a session that stayed up.
+        tokio::time::advance(STAYED_UP * 2).await;
+        r.failed();
+        assert_eq!(r.backoff, BACKOFF_MAX);
+        // Welcomed and up for the minute: the next loss waits the first backoff.
+        r.welcomed();
+        tokio::time::advance(STAYED_UP).await;
+        r.failed();
+        assert!(r.at <= Instant::now() + BACKOFF_FIRST + BACKOFF_FIRST / 4);
+        assert_eq!(r.backoff, BACKOFF_FIRST * 2);
     }
 
     #[test]
