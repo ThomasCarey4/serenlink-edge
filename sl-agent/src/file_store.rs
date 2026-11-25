@@ -2,7 +2,14 @@
 //! directory"). Each class is a run of segment files named by the logical offset they start at;
 //! the exact start of what is held is in a small `start` file per class. Every append is
 //! `fdatasync`ed before it returns; a new segment, a trim and a meta write also sync the
-//! directory. Meta slots are whole files replaced by rename.
+//! directory, as do the deletes of a truncate before the tail is shortened. Meta slots are whole
+//! files replaced by rename.
+//!
+//! At open, what a crash can leave is put right: segments wholly below the recorded start (a
+//! trim whose deletes were not yet durable) are deleted, and segments after a short one (a
+//! truncate whose deletes were not yet durable when the tail was shortened) are deleted. A gap
+//! after a full segment, or an overlap, is damage, and fails the open.
+use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::FileExt;
@@ -12,6 +19,9 @@ use sl_core::storage::{META_SLOTS, Storage, StorageError};
 use sl_proto::ids::Class;
 
 pub const SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
+/// Segment files held open for reading, per lane. Reads walk the log in order, so a few are
+/// enough, and the process stays far from its file limit.
+const READ_HANDLES: usize = 4;
 
 struct Lane {
     dir: PathBuf,
@@ -20,6 +30,12 @@ struct Lane {
     /// Start offsets of the segment files, ascending; each runs to the next, the last to `end`.
     segments: Vec<u64>,
     tail: Option<File>,
+    /// Open read handles by segment offset, most recently used first. An entry goes when its
+    /// segment is deleted: a later segment at the same offset is a new file.
+    readers: RefCell<Vec<(u64, File)>>,
+    /// An append failed and the file's length could not be read back: `end` may no longer be
+    /// where the file ends, so the lane takes no more appends this process.
+    broken: bool,
 }
 
 pub struct FileStore {
@@ -37,6 +53,23 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
+/// `create_dir_all`, with each directory it makes synced into its parent, so a power cut
+/// cannot lose a directory that files were then written into.
+pub fn create_dir_durable(dir: &Path) -> io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    let parent = dir.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(p) = parent {
+        create_dir_durable(p)?;
+    }
+    match fs::create_dir(dir) {
+        Ok(()) => sync_dir(parent.unwrap_or(Path::new("."))),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Write `data` to `path` by a synced temporary file and a rename, then sync the directory.
 fn replace(dir: &Path, name: &str, data: &[u8]) -> io::Result<()> {
     let tmp = dir.join(format!("{name}.tmp"));
@@ -52,8 +85,8 @@ fn io_err(_: io::Error) -> StorageError {
 }
 
 impl Lane {
-    fn open(dir: PathBuf) -> io::Result<Self> {
-        fs::create_dir_all(&dir)?;
+    fn open(dir: PathBuf, segment_bytes: u64) -> io::Result<Self> {
+        create_dir_durable(&dir)?;
         let mut segments = Vec::new();
         for entry in fs::read_dir(&dir)? {
             let path = entry?.path();
@@ -62,7 +95,8 @@ impl Lane {
                 let offset = stem
                     .parse::<u64>()
                     .map_err(|_| io::Error::other(format!("{}: not a segment name", path.display())))?;
-                segments.push(offset);
+                let len = fs::metadata(&path)?.len();
+                segments.push((offset, len));
             }
         }
         segments.sort_unstable();
@@ -72,20 +106,50 @@ impl Lane {
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(e),
         };
-        let mut end = recorded.unwrap_or(0);
-        for (i, &off) in segments.iter().enumerate() {
-            let len = fs::metadata(dir.join(seg_name(off)))?.len();
-            if let Some(&next) = segments.get(i + 1)
-                && off + len != next
-            {
-                return Err(io::Error::other(format!(
-                    "{}: segments not contiguous at {off}",
-                    dir.display()
-                )));
+        let mut removed = false;
+        // A trim writes `start` and then deletes; a crash can leave segments wholly below it,
+        // in any order the deletes happened to reach the disk.
+        if let Some(r) = recorded {
+            let below: Vec<u64> = segments.iter().filter(|&&(o, l)| o + l <= r).map(|&(o, _)| o).collect();
+            for &off in &below {
+                fs::remove_file(dir.join(seg_name(off)))?;
             }
-            end = off + len;
+            segments.retain(|&(o, l)| o + l > r);
+            removed |= !below.is_empty();
         }
-        let first = segments.first().copied();
+        // A truncate deletes the segments past the new end, syncs, then shortens the last
+        // one. Should the shortening reach the disk and the deletes not, the segment it
+        // shortened is followed by ones that are no longer part of the lane.
+        let mut keep = segments.len();
+        for i in 0..segments.len().saturating_sub(1) {
+            let ((off, len), (next, _)) = (segments[i], segments[i + 1]);
+            if off + len == next {
+                continue;
+            }
+            if off + len < next && len < segment_bytes {
+                eprintln!(
+                    "{}: segment {off} is short and followed by {}; deleting those left by a truncate",
+                    dir.display(),
+                    segments.len() - i - 1
+                );
+                keep = i + 1;
+                break;
+            }
+            return Err(io::Error::other(format!(
+                "{}: segments not contiguous at {off}",
+                dir.display()
+            )));
+        }
+        for &(off, _) in segments[keep..].iter().rev() {
+            fs::remove_file(dir.join(seg_name(off)))?;
+            removed = true;
+        }
+        segments.truncate(keep);
+        if removed {
+            sync_dir(&dir)?;
+        }
+        let end = segments.last().map_or(recorded.unwrap_or(0), |&(o, l)| o + l);
+        let first = segments.first().map(|&(o, _)| o);
         let start = match (recorded, first) {
             (Some(r), _) => r,
             (None, Some(f)) => f,
@@ -97,29 +161,63 @@ impl Lane {
                 dir.display()
             )));
         }
-        let mut lane = Lane {
+        Ok(Lane {
             dir,
             start: start.min(end),
             end,
-            segments,
+            segments: segments.into_iter().map(|(o, _)| o).collect(),
             tail: None,
-        };
-        // A crash between writing `start` and deleting segments leaves some wholly below it.
-        lane.drop_below(lane.start)?;
-        Ok(lane)
+            readers: RefCell::new(Vec::new()),
+            broken: false,
+        })
+    }
+
+    /// Forget the read handle of the segment at `off`, which is being deleted.
+    fn forget(&mut self, off: u64) {
+        self.readers.get_mut().retain(|(o, _)| *o != off);
     }
 
     fn drop_below(&mut self, start: u64) -> io::Result<()> {
+        let mut removed = false;
         while self.segments.len() > 1 && self.segments[1] <= start {
             let off = self.segments.remove(0);
+            self.forget(off);
             fs::remove_file(self.dir.join(seg_name(off)))?;
+            removed = true;
         }
         if self.segments.len() == 1 && self.end <= start && self.end > self.segments[0] {
             let off = self.segments.remove(0);
             self.tail = None;
+            self.forget(off);
             fs::remove_file(self.dir.join(seg_name(off)))?;
+            removed = true;
+        }
+        if removed {
+            sync_dir(&self.dir)?;
         }
         Ok(())
+    }
+
+    /// Read `buf.len()` bytes at `at` in the segment that starts at `seg`, through a cached
+    /// handle.
+    fn read_in(&self, seg: u64, at: u64, buf: &mut [u8]) -> io::Result<()> {
+        let mut readers = self.readers.borrow_mut();
+        let i = match readers.iter().position(|(o, _)| *o == seg) {
+            Some(i) => i,
+            None => {
+                let f = File::open(self.dir.join(seg_name(seg)))?;
+                if readers.len() >= READ_HANDLES {
+                    readers.pop();
+                }
+                readers.insert(0, (seg, f));
+                0
+            }
+        };
+        if i != 0 {
+            let e = readers.remove(i);
+            readers.insert(0, e);
+        }
+        readers[0].1.read_exact_at(buf, at)
     }
 
     fn seg_len(&self, i: usize) -> u64 {
@@ -133,12 +231,13 @@ impl FileStore {
     }
 
     pub fn open_with_segment(dir: &Path, capacity: u64, segment_bytes: u64) -> io::Result<Self> {
-        fs::create_dir_all(dir.join("meta"))?;
-        let lane = |c: &str| Lane::open(dir.join(c));
+        create_dir_durable(&dir.join("meta"))?;
+        let segment_bytes = segment_bytes.max(1);
+        let lane = |c: &str| Lane::open(dir.join(c), segment_bytes);
         Ok(Self {
             dir: dir.to_path_buf(),
             capacity,
-            segment_bytes: segment_bytes.max(1),
+            segment_bytes,
             lanes: [lane("p0")?, lane("p1")?, lane("p2")?],
         })
     }
@@ -150,6 +249,9 @@ impl FileStore {
     fn append_inner(&mut self, class: Class, data: &[u8]) -> io::Result<()> {
         let seg_bytes = self.segment_bytes;
         let lane = &mut self.lanes[class.index()];
+        if lane.broken {
+            return Err(io::Error::other("an earlier append left this lane's end unknown"));
+        }
         let mut rest = data;
         while !rest.is_empty() {
             let need_new = match lane.segments.last() {
@@ -158,6 +260,7 @@ impl FileStore {
             };
             if need_new {
                 let off = lane.end;
+                lane.forget(off);
                 let f = OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -176,8 +279,9 @@ impl FileStore {
             let f = lane.tail.as_mut().unwrap();
             if let Err(e) = f.write_all(&rest[..n]).and_then(|_| f.sync_data()) {
                 // What reached the file is now the end; the log's checksums find the tear.
-                if let Ok(m) = fs::metadata(lane.dir.join(seg_name(last))) {
-                    lane.end = last + m.len();
+                match fs::metadata(lane.dir.join(seg_name(last))) {
+                    Ok(m) => lane.end = last + m.len(),
+                    Err(_) => lane.broken = true,
                 }
                 lane.tail = None;
                 return Err(e);
@@ -221,8 +325,7 @@ impl Storage for FileStore {
             let i = lane.segments.partition_point(|&s| s <= at) - 1;
             let seg = lane.segments[i];
             let n = ((lane.seg_len(i) - (at - seg)) as usize).min(buf.len() - done);
-            let f = File::open(lane.dir.join(seg_name(seg))).map_err(io_err)?;
-            f.read_exact_at(&mut buf[done..done + n], at - seg).map_err(io_err)?;
+            lane.read_in(seg, at - seg, &mut buf[done..done + n]).map_err(io_err)?;
             done += n;
         }
         Ok(())
@@ -236,8 +339,7 @@ impl Storage for FileStore {
         }
         replace(&lane.dir, "start", &new_start.to_le_bytes()).map_err(io_err)?;
         lane.start = new_start;
-        lane.drop_below(new_start).map_err(io_err)?;
-        sync_dir(&lane.dir).map_err(io_err)
+        lane.drop_below(new_start).map_err(io_err)
     }
 
     fn truncate(&mut self, class: Class, new_end: u64) -> Result<(), StorageError> {
@@ -247,13 +349,21 @@ impl Storage for FileStore {
             return Ok(());
         }
         lane.tail = None;
+        let mut removed = false;
+        // Newest first, so a crash part way leaves the lane contiguous.
         while let Some(&last) = lane.segments.last() {
             if last >= new_end && lane.segments.len() > 1 {
+                lane.forget(last);
                 fs::remove_file(lane.dir.join(seg_name(last))).map_err(io_err)?;
                 lane.segments.pop();
+                removed = true;
             } else {
                 break;
             }
+        }
+        // The deletes are durable before the tail is shortened (see `Lane::open`).
+        if removed {
+            sync_dir(&lane.dir).map_err(io_err)?;
         }
         if let Some(&last) = lane.segments.last() {
             let f = OpenOptions::new()
