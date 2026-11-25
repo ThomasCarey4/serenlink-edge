@@ -14,7 +14,7 @@
 //!
 //! A log that cannot be opened is set aside as `log.broken-<secs>` and a fresh one started,
 //! once per process (`open_device`), so a damaged log does not become a restart loop.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -64,8 +64,10 @@ const BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// A session that lasts this long resets the backoff; one that is welcomed and then lost
 /// sooner (a gateway that refuses after the handshake, say) keeps it growing.
 const STAYED_UP: Duration = Duration::from_secs(60);
-/// The sources document is fetched at most this often.
+/// The sources document is fetched at most this often, and a source it did not name is asked
+/// about again after this, doubling each time up to `NAMES_MAX`.
 const NAMES_EVERY: Duration = Duration::from_secs(60);
+const NAMES_MAX: Duration = Duration::from_secs(3_600);
 const INTAKE: usize = 8_192;
 /// The gateway's idle timeout (`sl-gateway serve --idle-secs`, default 90; it pings every 30):
 /// a gateway heard from for no longer than this is gone, and so is a send that waits this long.
@@ -132,11 +134,40 @@ fn spawn_signalk(url: String, clock: Clock, tx: mpsc::Sender<(Update, u64, u64)>
     Ok(())
 }
 
+/// When to fetch the sources document for a source it has not named: at once for a source
+/// not asked about yet, then again after 1 minute, 2, 4, ... up to an hour (a source with no
+/// NAME, one that is not on NMEA 2000, keeps asking that rarely; one that SignalK had not named
+/// yet is picked up). Never twice within `NAMES_EVERY`. One per SignalK connection.
+#[derive(Default)]
+struct NameFetches {
+    last: Option<Instant>,
+    retry: HashMap<String, (Instant, Duration)>,
+}
+
+impl NameFetches {
+    /// Whether an update from the unnamed `source` at `now` starts a fetch.
+    fn due(&mut self, source: &str, now: Instant) -> bool {
+        if self.last.is_some_and(|t| now < t + NAMES_EVERY) {
+            return false;
+        }
+        match self.retry.get_mut(source) {
+            Some((at, _)) if now < *at => return false,
+            Some((at, every)) => {
+                *every = (*every * 2).min(NAMES_MAX);
+                *at = now + *every;
+            }
+            None => {
+                self.retry.insert(source.to_owned(), (now + NAMES_EVERY, NAMES_EVERY));
+            }
+        }
+        self.last = Some(now);
+        true
+    }
+}
+
 /// SignalK into `tx` for ever, reconnecting with backoff. `$source` NAMEs come from the sources
-/// document, fetched on a task of its own when a source appears that the last document did
-/// not name, at most once a minute; a source that a fetch it started still did not name (one
-/// that is not on NMEA 2000, say) starts no other fetch until SignalK reconnects. An update
-/// whose source is not named yet goes with NAME 0. An update that finds the channel full is
+/// document, fetched on a task of its own as `NameFetches` says. An update whose source is not
+/// named yet goes with NAME 0. An update that finds the channel full is
 /// dropped and counted. Each update goes with its NAME and the time it arrived, on the agent's
 /// clock.
 async fn signalk(url: String, clock: Clock, tx: mpsc::Sender<(Update, u64, u64)>) {
@@ -151,8 +182,7 @@ async fn signalk(url: String, clock: Clock, tx: mpsc::Sender<(Update, u64, u64)>
                 eprintln!("SignalK connected: {url}");
                 backoff = Duration::from_secs(1);
                 // A new connection may fetch the names again for any source.
-                let mut fetched_at: Option<Instant> = None;
-                let mut asked: HashSet<String> = HashSet::new();
+                let mut fetches = NameFetches::default();
                 loop {
                     let msg = match tokio::time::timeout(SIGNALK_IDLE, ws.next()).await {
                         Ok(Some(Ok(m))) => m,
@@ -171,12 +201,9 @@ async fn signalk(url: String, clock: Clock, tx: mpsc::Sender<(Update, u64, u64)>
                     for u in parse_delta(text.as_str()) {
                         let name = known.lock().unwrap_or_else(|e| e.into_inner()).get(&u.source).copied();
                         if name.is_none()
-                            && !asked.contains(&u.source)
-                            && fetched_at.is_none_or(|t| t.elapsed() >= NAMES_EVERY)
                             && let Some(src_url) = &names_url
+                            && fetches.due(&u.source, Instant::now())
                         {
-                            fetched_at = Some(Instant::now());
-                            asked.insert(u.source.clone());
                             tokio::spawn(fetch_names(src_url.clone(), known.clone()));
                         }
                         match tx.try_send((u, name.unwrap_or(0), mono)) {
@@ -823,6 +850,34 @@ fn lose(link: &mut Option<Link<Tls>>, dev: &mut AgentDevice, retry: &mut Retry, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unnamed_source_is_asked_about_again_ever_more_rarely() {
+        let t0 = Instant::now();
+        let min = |m: u64| t0 + Duration::from_secs(60 * m);
+        let mut f = NameFetches::default();
+        assert!(f.due("can0.1", t0));
+        // Nothing twice within a minute, whichever source.
+        assert!(!f.due("can0.1", t0 + Duration::from_secs(59)));
+        assert!(!f.due("derived", t0 + Duration::from_secs(59)));
+        // The same source: again at 1 minute, then after 2, 4, 8, ... minutes, capped at an hour.
+        assert!(f.due("can0.1", min(1)));
+        assert!(!f.due("can0.1", min(2)));
+        assert!(f.due("can0.1", min(3)));
+        assert!(!f.due("can0.1", min(6)));
+        assert!(f.due("can0.1", min(7)));
+        let mut at = 7;
+        let mut gap = 8;
+        for _ in 0..10 {
+            assert!(!f.due("can0.1", min(at + gap - 1)));
+            at += gap;
+            assert!(f.due("can0.1", min(at)));
+            gap = (gap * 2).min(60);
+        }
+        assert_eq!(gap, 60);
+        // A new source is asked about at once (a minute after the last fetch).
+        assert!(f.due("derived", min(at + 1)));
+    }
 
     #[test]
     fn jitter_adds_at_most_a_quarter() {
