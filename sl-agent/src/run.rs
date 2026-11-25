@@ -526,29 +526,44 @@ fn wait_for_clock() -> u64 {
     }
 }
 
-/// The newest boot id in the log at `dir`: the boot of the newest readable frame of each class.
-/// `None` when there is no log or it will not open.
+/// Frames read back from the newest, per class, looking for one that decodes.
+const BOOT_SCAN_FRAMES: usize = 16;
+
+/// The newest boot id in the log at `dir`: per class, the boot of the newest of its last
+/// `BOOT_SCAN_FRAMES` frames that reads and decodes. `None` when there is no log, it will not
+/// open, or nothing reads. Only a lost boot counter needs this, so a whole header scan per
+/// class is affordable.
 pub fn highest_boot_in_log(dir: &Path) -> Option<u32> {
     use sl_core::log::DurableLog;
     if !dir.is_dir() {
         return None;
     }
     let store = FileStore::open(dir, u64::MAX).ok()?;
-    let (mut log, _) = DurableLog::open(store).ok()?;
+    let (log, _) = DurableLog::open(store).ok()?;
     let mut best = None;
     for class in Class::ALL {
-        let next = log.next_seq(class);
-        if next == 0 || log.rewind(class, next - 1).is_err() {
-            continue;
-        }
-        let Ok(Some(frame)) = log.peek_unsent(class) else {
+        let Ok(frames) = log.front_frames(class, u64::MAX) else {
             continue;
         };
-        let boot = Compression::from_u8(frame.header.compression)
-            .and_then(|c| sl_proto::compress::decompress(c, &frame.payload, 16 << 20).ok())
-            .and_then(|raw| sl_proto::block::Block::decode(&raw).ok())
-            .map(|b| b.boot_id);
+        let boot = frames.iter().rev().take(BOOT_SCAN_FRAMES).find_map(|f| {
+            let payload = log.read_payload(class, f).ok()??;
+            let raw = sl_proto::compress::decompress(Compression::from_u8(f.compression)?, &payload, 16 << 20).ok()?;
+            sl_proto::block::Block::decode(&raw).ok().map(|b| b.boot_id)
+        });
         best = best.max(boot);
+    }
+    best
+}
+
+/// The newest boot id in `state/log` and in every log set aside beside it.
+pub fn highest_boot_in_state(state: &Path) -> Option<u32> {
+    let mut best = highest_boot_in_log(&state.join("log"));
+    if let Ok(entries) = std::fs::read_dir(state) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with("log.broken-") {
+                best = best.max(highest_boot_in_log(&e.path()));
+            }
+        }
     }
     best
 }
@@ -588,10 +603,8 @@ pub async fn run(args: Args) -> Result<(), String> {
     let (tx, mut rx) = mpsc::channel::<(Update, u64, u64)>(INTAKE);
     spawn_signalk(args.signalk_url.clone(), clock, tx)?;
     // Blocking here is fine: nothing else runs on this runtime yet, and SignalK has its own.
-    let boot = resolve_boot(state, &mut wait_for_clock, &mut || {
-        highest_boot_in_log(&state.join("log"))
-    })
-    .map_err(|e| format!("the boot counter: {e}"))?;
+    let boot = resolve_boot(state, &mut wait_for_clock, &mut || highest_boot_in_state(state))
+        .map_err(|e| format!("the boot counter: {e}"))?;
     if let Some(why) = &boot.restarted {
         eprintln!(
             "<3>sl-agent: ERROR: the boot counter: {why}; restarted from the wall clock at {}",

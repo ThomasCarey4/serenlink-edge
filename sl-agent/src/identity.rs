@@ -67,8 +67,9 @@ pub struct Boot {
 ///   restart it.
 /// - A counter that is damaged or cannot be read, or one that is missing when earlier state is
 ///   not (`boot.broken-*`, a `log.broken-*`, or any file under `log`), restarts from the wall
-///   clock: `max(clock seconds, floor + 1)`, where the floor is the highest boot id in a
-///   `boot.broken-*` copy and `log_floor()` (the newest boot found in the log). `clock()` is
+///   clock: `max(clock seconds, floor + 1)`, where the floor is `log_floor()` (the newest boot
+///   found in the log and in any log set aside). A `boot.broken-*` copy is never a floor: one
+///   is only made of a counter that did not read as a boot id. `clock()` is
 ///   called only then and must return seconds at or after `CLOCK_SET_AFTER` (the agent waits
 ///   for the clock to be set). The new counter is written first (temporary file, fsync, rename
 ///   over, directory sync), and only then are the old bytes, if any, copied aside to
@@ -107,7 +108,7 @@ pub fn resolve_boot(
         }
         Err(e) => (None, format!("{}: {e}", path.display())),
     };
-    let floor = broken_floor(state)?.max(log_floor().unwrap_or(0));
+    let floor = log_floor().unwrap_or(0);
     let secs = clock();
     if secs < CLOCK_SET_AFTER {
         return Err(io::Error::other(
@@ -168,21 +169,6 @@ fn any_file(dir: &Path) -> io::Result<bool> {
         }
     }
     Ok(false)
-}
-
-/// The highest boot id in a well-formed `boot.broken-*` copy, or 0.
-fn broken_floor(state: &Path) -> io::Result<u32> {
-    let mut floor = 0;
-    for entry in fs::read_dir(state)? {
-        let entry = entry?;
-        if entry.file_name().to_string_lossy().starts_with("boot.broken-")
-            && let Ok(b) = fs::read(entry.path())
-            && let Ok(b) = <[u8; 4]>::try_from(b.as_slice())
-        {
-            floor = floor.max(u32::from_le_bytes(b));
-        }
-    }
-    Ok(floor)
 }
 
 fn write_boot(path: &Path, boot: u32) -> io::Result<()> {

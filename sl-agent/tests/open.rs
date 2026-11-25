@@ -1,7 +1,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
-use sl_agent::run::{RUNNING, highest_boot_in_log, open_device};
+use sl_agent::run::{RUNNING, highest_boot_in_log, highest_boot_in_state, open_device};
 use sl_core::device::DeviceConfig;
 use sl_core::recorder::RecorderConfig;
 use sl_core::storage::Storage as _;
@@ -159,4 +159,45 @@ fn the_highest_boot_in_a_log_is_its_newest_frames() {
         dev.flush(20, &mut Vec::new()).unwrap();
     }
     assert_eq!(highest_boot_in_log(&log), Some(7));
+
+    // The newest frame's payload rots: the boot comes from the frame before it.
+    let p1 = log.join("p1");
+    let mut segs: Vec<_> = fs::read_dir(&p1)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "seg"))
+        .collect();
+    segs.sort();
+    let last = segs.last().unwrap();
+    let mut bytes = fs::read(last).unwrap();
+    let n = bytes.len();
+    bytes[n - 2] ^= 0xff;
+    fs::write(last, bytes).unwrap();
+    assert_eq!(highest_boot_in_log(&log), Some(3));
+}
+
+#[test]
+fn the_highest_boot_counts_the_logs_set_aside() {
+    use sl_proto::record::{Define, Kind};
+    use sl_proto::value::{Value, ValueType};
+    let state = tempfile::tempdir().unwrap();
+    let mut c = cfg();
+    c.boot_id = 9;
+    let (mut dev, _, _) = open_device(state.path(), 1 << 30, c, &baseline(), 1).unwrap();
+    let def = Define {
+        local_id: 1,
+        stable_key: 0,
+        path: "navigation.speedOverGround".into(),
+        source: 0,
+        value_type: ValueType::F64,
+        unit: String::new(),
+        kind: Kind::Linear,
+    };
+    dev.sample(Class::P1, &def, 10, Value::F64(1.0));
+    dev.flush(20, &mut Vec::new()).unwrap();
+    drop(dev);
+    fs::rename(state.path().join("log"), state.path().join("log.broken-1790000000")).unwrap();
+    drop(open_device(state.path(), 1 << 30, cfg(), &baseline(), 1).unwrap());
+    assert_eq!(highest_boot_in_log(&state.path().join("log")), None);
+    assert_eq!(highest_boot_in_state(state.path()), Some(9));
 }
