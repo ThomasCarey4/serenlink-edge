@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "SerenLink edge engine: durable log, recorder and upload session"
+license = "Apache-2.0"
 
 [features]
 default = ["std"]
