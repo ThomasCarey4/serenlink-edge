@@ -73,9 +73,19 @@ const INTAKE: usize = 8_192;
 /// The gateway's idle timeout (`sl-gateway serve --idle-secs`, default 90; it pings every 30):
 /// a gateway heard from for no longer than this is gone, and so is a send that waits this long.
 const GATEWAY_IDLE: Duration = Duration::from_secs(90);
-/// Messages queued for a connection's writer. The device sends only what the gateway's credit
-/// allows, so this fills only when the uplink has stopped; then the session is dropped.
+/// Messages queued for a connection's writer. Credit does not bound it: credit is in bytes, and
+/// the gateway's default 1 MiB is ~16,000 P0 frames of 64 bytes. What bounds it is `POLL_ROOM`:
+/// the session is polled only while that much is free, so the queue fills only when the uplink
+/// has stopped, and then the writer gives up after `GATEWAY_IDLE` and the session is dropped.
+/// (Before 2026-11-27 every reply polled whatever the credit allowed, and a backlog after a link
+/// cut overflowed the queue on each reconnect: one session every five minutes.)
 const OUT_QUEUE: usize = 1_024;
+/// The most batches one poll returns (`DeviceConfig::max_batches_per_poll`).
+const MAX_BATCHES_PER_POLL: usize = 32;
+/// Free queue slots a poll needs: its batches and the control lane's Fetch, with as many again
+/// left for the replies that messages arriving meanwhile may queue. A queue too full to poll
+/// still holds hundreds of messages, so an Ack follows as they go out and polls again.
+const POLL_ROOM: usize = 2 * MAX_BATCHES_PER_POLL;
 
 #[derive(Parser, Debug, Clone)]
 #[command(about = "SerenLink agent: records a SignalK server into the durable log and uploads it")]
@@ -329,6 +339,16 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Link<T> {
                 })?;
         }
         Ok(())
+    }
+
+    /// Free slots in the writer's queue.
+    fn room(&self) -> usize {
+        self.out.capacity()
+    }
+
+    /// Whether a poll's output is sure to fit (`POLL_ROOM`).
+    fn may_poll(&self) -> bool {
+        self.room() >= POLL_ROOM
     }
 
     /// The next thing to act on. Cancel-safe: a select may drop it at any await.
@@ -653,7 +673,7 @@ pub async fn run(args: Args) -> Result<(), String> {
             table_version: 1,
             ..RecorderConfig::default()
         },
-        max_batches_per_poll: 32,
+        max_batches_per_poll: MAX_BATCHES_PER_POLL,
         control_lane: true,
     };
     let (mut dev, recovery, _) = open_device(state, args.capacity, cfg, &baseline, unix_secs())?;
@@ -802,9 +822,10 @@ pub async fn run(args: Args) -> Result<(), String> {
         let fault = match turn {
             Turn::Fatal(e) => Some(e),
             Turn::Skip => None,
-            // Whatever the session may send now: batches the credit allows, reports, a Fetch.
+            // Whatever the session may send now: batches the credit allows, reports, a Fetch;
+            // not while the writer's queue is too full to take them (`POLL_ROOM`).
             Turn::Poll => match link.as_ref() {
-                Some(l) if dev.connected() => {
+                Some(l) if dev.connected() && l.may_poll() => {
                     let out = dev.poll();
                     if let Some(e) = dev.take_storage_fault() {
                         Some(format!("reading the log failed: {e:?}"))
@@ -1003,6 +1024,31 @@ mod tests {
         }
         assert!(Instant::now() - start >= GATEWAY_IDLE);
         assert!(link.queue(vec![env]).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_uplink_pauses_polling_before_the_queue_overflows() {
+        // A backlog of small frames: the credit allows far more than the queue holds (1 MiB is
+        // ~16,000 P0 frames of 64 bytes), so only the queue's room may bound what a poll adds.
+        // The gateway reads nothing until the end: the uplink is slower than the polls.
+        let (link, mut gw) = pair(256).await;
+        let env = Envelope { body: None };
+        let mut polls = 0;
+        while link.may_poll() {
+            link.queue(vec![env.clone(); MAX_BATCHES_PER_POLL]).expect("a poll it allowed overflowed the queue");
+            polls += 1;
+            assert!(polls <= OUT_QUEUE, "polling never paused");
+        }
+        // Paused with room left for the replies a message may queue meanwhile.
+        assert!(link.room() >= POLL_ROOM - MAX_BATCHES_PER_POLL);
+        link.queue(vec![env.clone(); POLL_ROOM - MAX_BATCHES_PER_POLL]).unwrap();
+        // Once the uplink takes what is queued, polling resumes.
+        let mut got = 0;
+        while !link.may_poll() || link.room() < OUT_QUEUE - 1 {
+            gw.next().await.unwrap().unwrap();
+            got += 1;
+        }
+        assert!(got > 0);
     }
 
     #[tokio::test(start_paused = true)]
