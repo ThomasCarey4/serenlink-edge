@@ -407,6 +407,8 @@ struct Retry {
     at: Instant,
     backoff: Duration,
     welcomed_at: Option<Instant>,
+    /// The session welcomed at `welcomed_at` has had data acknowledged.
+    acked: bool,
 }
 
 impl Retry {
@@ -415,12 +417,18 @@ impl Retry {
             at: Instant::now(),
             backoff: BACKOFF_FIRST,
             welcomed_at: None,
+            acked: false,
         }
     }
 
+    /// A session lost after it stayed up, or after the gateway acknowledged data in it, made
+    /// progress: the next try waits the first backoff. Only sessions that did neither (a
+    /// gateway refusing after the handshake, say) grow it. Without the Ack rule a fault that
+    /// ends each session early, however much it moved, waited up to five minutes each time.
     fn failed(&mut self) {
         let now = Instant::now();
-        if self.welcomed_at.take().is_some_and(|t| now - t >= STAYED_UP) {
+        let acked = std::mem::take(&mut self.acked);
+        if self.welcomed_at.take().is_some_and(|t| acked || now - t >= STAYED_UP) {
             self.backoff = BACKOFF_FIRST;
         }
         self.at = now + jitter(self.backoff);
@@ -429,6 +437,12 @@ impl Retry {
 
     fn welcomed(&mut self) {
         self.welcomed_at = Some(Instant::now());
+        self.acked = false;
+    }
+
+    /// The gateway acknowledged data in this session.
+    fn progressed(&mut self) {
+        self.acked = self.welcomed_at.is_some();
     }
 }
 
@@ -706,6 +720,8 @@ pub async fn run(args: Args) -> Result<(), String> {
     let mut connecting: Option<Connecting> = None;
     let mut retry = Retry::new();
     let mut welcomed = false;
+    // This connection has said its uplink paused polling (once per connection).
+    let mut paused = false;
 
     loop {
         if link.is_none() && connecting.is_none() && Instant::now() >= retry.at {
@@ -764,6 +780,7 @@ pub async fn run(args: Args) -> Result<(), String> {
                             } else {
                                 link = Some(l);
                                 welcomed = false;
+                                paused = false;
                             }
                             Turn::Skip
                         }
@@ -795,8 +812,13 @@ pub async fn run(args: Args) -> Result<(), String> {
                     }
                     Ok(Some(env)) => {
                         let is_welcome = matches!(env.body, Some(Body::Welcome(_)));
+                        let is_ack = matches!(env.body, Some(Body::Ack(_)));
                         match dev.receive(env, clock.mono_ms()) {
                             Ok(out) => {
+                                // Only an Ack the device took (its check held) is progress.
+                                if is_ack {
+                                    retry.progressed();
+                                }
                                 if is_welcome && !welcomed {
                                     welcomed = true;
                                     retry.welcomed();
@@ -825,7 +847,17 @@ pub async fn run(args: Args) -> Result<(), String> {
             // Whatever the session may send now: batches the credit allows, reports, a Fetch;
             // not while the writer's queue is too full to take them (`POLL_ROOM`).
             Turn::Poll => match link.as_ref() {
-                Some(l) if dev.connected() && l.may_poll() => {
+                Some(l) if dev.connected() && !l.may_poll() => {
+                    if !paused {
+                        paused = true;
+                        eprintln!(
+                            "upload paused: the uplink is slower than the backlog ({} of {OUT_QUEUE} queued); said once per connection",
+                            OUT_QUEUE - l.room()
+                        );
+                    }
+                    None
+                }
+                Some(l) if dev.connected() => {
                     let out = dev.poll();
                     if let Some(e) = dev.take_storage_fault() {
                         Some(format!("reading the log failed: {e:?}"))
@@ -1079,6 +1111,30 @@ mod tests {
         r.failed();
         assert!(r.at <= Instant::now() + BACKOFF_FIRST + BACKOFF_FIRST / 4);
         assert_eq!(r.backoff, BACKOFF_FIRST * 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_that_had_data_acknowledged_resets_the_backoff_however_short() {
+        let mut r = Retry::new();
+        for _ in 0..20 {
+            r.failed();
+        }
+        assert_eq!(r.backoff, BACKOFF_MAX);
+        // Welcomed, an Ack, lost after a second: it moved data, so the next try is soon.
+        r.welcomed();
+        r.progressed();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        r.failed();
+        assert!(r.at <= Instant::now() + BACKOFF_FIRST + BACKOFF_FIRST / 4);
+        assert_eq!(r.backoff, BACKOFF_FIRST * 2);
+        // The Ack counts for that session only: the next one, welcomed and lost with none, grows.
+        r.welcomed();
+        r.failed();
+        assert_eq!(r.backoff, BACKOFF_FIRST * 4);
+        // An Ack with no Welcome first (none can come) is not a session either.
+        r.progressed();
+        r.failed();
+        assert_eq!(r.backoff, BACKOFF_FIRST * 8);
     }
 
     #[test]
